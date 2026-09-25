@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Folio PDF Editor</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-select" viewBox="0 0 24 24"><path d="M5 3.5l13.5 7.8-6.1 1.7-3.3 5.9z"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M3.5 6.5v-2h11v2M9 4.5v15M7 19.5h4M17.5 8.5v11M15.5 8.5h4M15.5 19.5h4"/></symbol>
+    <symbol id="i-text" viewBox="0 0 24 24"><path d="M4 7V4.5h11V7M9.5 4.5v15M7.5 19.5h4M18 12v7M14.5 15.5h7"/></symbol>
+    <symbol id="i-whiteout" viewBox="0 0 24 24"><path d="M15.5 3.5l5 5L10 19H5.5l-2-2z M12.5 6.5l5 5M10 19.5h10.5"/></symbol>
+    <symbol id="i-highlight" viewBox="0 0 24 24"><path d="M14 4l6 6-8 8H7v-5zM4 20.5h9M9.5 10.5l4 4"/></symbol>
+    <symbol id="i-rect" viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/></symbol>
+    <symbol id="i-ellipse" viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8.5" ry="6.5"/></symbol>
+    <symbol id="i-line" viewBox="0 0 24 24"><path d="M5 19L19 5"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 19L19 5M10 5h9v9"/></symbol>
+    <symbol id="i-draw" viewBox="0 0 24 24"><path d="M3 20c3.5-1 5.5-3.5 7-6.5s3.5-8.5 7.5-9c2.2-.2 3 2 2 4-2 4-8 5-10.5 9.5"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5.5-5 4 3.5 2.5-2 4.5 4"/></symbol>
+    <symbol id="i-sign" viewBox="0 0 24 24"><path d="M3 16c2-4 4-6.5 5-6.5 2 0-1.5 7 1 7 2 0 2.5-4.5 4.5-4.5s1 3 3 3c1.2 0 2.5-1 4.5-2.5M3 20.5h18"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M3.5 18.5v-12a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v2M3.5 18.5l3-8h15l-3 8z"/></symbol>
+    <symbol id="i-merge" viewBox="0 0 24 24"><path d="M6 3.5h8l4 4v5M18 17v5M15.5 19.5h5M6 3.5v17h7"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M4.5 16.5v3h15v-3"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7.5L4.5 12 9 16.5M5 12h9.5a5 5 0 0 1 0 10H12"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 7.5l4.5 4.5-4.5 4.5M19 12H9.5a5 5 0 0 0 0 10H12"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M6 12h12"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 6v12M6 12h12"/></symbol>
+    <symbol id="i-find" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></symbol>
+    <symbol id="i-rotl" viewBox="0 0 24 24"><path d="M4.5 4.5v5h5M5 9.5A8 8 0 1 1 6 16"/></symbol>
+    <symbol id="i-rotr" viewBox="0 0 24 24"><path d="M19.5 4.5v5h-5M19 9.5A8 8 0 1 0 18 16"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 6.5h15M9.5 6.5V4h5v2.5M6.5 6.5l1 13h9l1-13M10.5 10v6M13.5 10v6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="1.5"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></symbol>
+    <symbol id="i-page" viewBox="0 0 24 24"><path d="M6 3.5h8l4 4v13H6zM14 3.5v4h4M12 11v6M9 14h6"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-front" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="1"/><path d="M15 9V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h4"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><rect x="4" y="4" width="11" height="11" rx="1"/><path d="M15 9h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-4"/></symbol>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <div class="brand"><span class="mark">F</span><span class="brand-name">Folio</span></div>
+  <div class="file">
+    <span id="fileName" class="file-name">No document</span>
+    <span id="dirtyDot" class="dirty" hidden title="Unsaved changes"></span>
+  </div>
+  <div class="tb-group">
+    <button class="tb" id="btnOpen" title="Open PDF (Ctrl+O)"><svg><use href="#i-open"/></svg><span>Open</span></button>
+    <button class="tb" id="btnMerge" title="Append pages from another PDF" disabled><svg><use href="#i-merge"/></svg><span>Merge</span></button>
+  </div>
+  <div class="tb-group">
+    <button class="tb icon" id="btnUndo" title="Undo (Ctrl+Z)" disabled><svg><use href="#i-undo"/></svg></button>
+    <button class="tb icon" id="btnRedo" title="Redo (Ctrl+Y)" disabled><svg><use href="#i-redo"/></svg></button>
+  </div>
+  <div class="tb-group zoom">
+    <button class="tb icon" id="btnZoomOut" title="Zoom out (Ctrl+-)"><svg><use href="#i-minus"/></svg></button>
+    <select id="zoomSel" title="Zoom">
+      <option value="fitw">Fit width</option><option value="fitp">Fit page</option>
+      <option value="0.5">50%</option><option value="0.75">75%</option><option value="1">100%</option>
+      <option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option>
+      <option value="3">300%</option><option value="4">400%</option>
+      <option value="custom" hidden id="zoomCustom">100%</option>
+    </select>
+    <button class="tb icon" id="btnZoomIn" title="Zoom in (Ctrl++)"><svg><use href="#i-plus"/></svg></button>
+  </div>
+  <div class="tb-group">
+    <button class="tb icon" id="btnFind" title="Find &amp; replace (Ctrl+F)" disabled><svg><use href="#i-find"/></svg></button>
+  </div>
+  <div class="spacer"></div>
+  <button class="tb" id="btnSaveAs" title="Save a copy (Ctrl+Shift+S)" disabled><span>Save as…</span></button>
+  <button class="tb primary" id="btnSave" title="Save (Ctrl+S)" disabled><svg><use href="#i-save"/></svg><span>Save PDF</span></button>
+</header>
+
+<div class="main">
+  <nav class="rail" id="rail" aria-label="Tools">
+    <button class="tool" data-tool="select" title="Select &amp; move (V)"><svg><use href="#i-select"/></svg></button>
+    <button class="tool" data-tool="edit" title="Edit existing text (E)"><svg><use href="#i-edit"/></svg></button>
+    <button class="tool" data-tool="text" title="Add text (T)"><svg><use href="#i-text"/></svg></button>
+    <div class="rail-sep"></div>
+    <button class="tool" data-tool="whiteout" title="Whiteout / redact area (W)"><svg><use href="#i-whiteout"/></svg></button>
+    <button class="tool" data-tool="highlight" title="Highlight (H)"><svg><use href="#i-highlight"/></svg></button>
+    <button class="tool" data-tool="draw" title="Freehand draw (D)"><svg><use href="#i-draw"/></svg></button>
+    <div class="rail-sep"></div>
+    <button class="tool" data-tool="rect" title="Rectangle (R)"><svg><use href="#i-rect"/></svg></button>
+    <button class="tool" data-tool="ellipse" title="Ellipse (O)"><svg><use href="#i-ellipse"/></svg></button>
+    <button class="tool" data-tool="line" title="Line (L)"><svg><use href="#i-line"/></svg></button>
+    <button class="tool" data-tool="arrow" title="Arrow (A)"><svg><use href="#i-arrow"/></svg></button>
+    <div class="rail-sep"></div>
+    <button class="tool" data-tool="image" title="Insert image (I)"><svg><use href="#i-image"/></svg></button>
+    <button class="tool" data-tool="sign" title="Signature (S)"><svg><use href="#i-sign"/></svg></button>
+  </nav>
+
+  <aside class="thumbs" id="thumbsPanel">
+    <div class="panel-head">
+      <span>Pages</span>
+      <button class="mini" id="btnAddPage" title="Insert blank page after current" disabled><svg><use href="#i-page"/></svg></button>
+    </div>
+    <div class="thumb-list" id="thumbs"></div>
+  </aside>
+
+  <main class="viewport" id="viewport">
+    <div class="pages" id="pages"></div>
+    <section class="welcome" id="welcome">
+      <div class="drop" id="dropZone">
+        <h1>Edit any PDF, right here on your machine.</h1>
+        <p class="lede">Change existing text in place, add text, images and signatures, white out, highlight, draw, and reorganise pages. Nothing leaves your computer.</p>
+        <div class="welcome-actions">
+          <button class="btn primary" id="btnOpen2"><svg><use href="#i-open"/></svg>Open a PDF</button>
+          <button class="btn" id="btnSample">Try a sample document</button>
+        </div>
+        <p class="hint">or drop a PDF anywhere in this window</p>
+      </div>
+      <dl class="keys">
+        <div><dt>E</dt><dd>Edit existing text</dd></div>
+        <div><dt>T</dt><dd>Add text</dd></div>
+        <div><dt>W</dt><dd>Whiteout</dd></div>
+        <div><dt>H</dt><dd>Highlight</dd></div>
+        <div><dt>Ctrl F</dt><dd>Find &amp; replace</dd></div>
+        <div><dt>Ctrl S</dt><dd>Save</dd></div>
+      </dl>
+    </section>
+  </main>
+
+  <aside class="props" id="props" aria-label="Properties"></aside>
+</div>
+
+<footer class="status">
+  <span id="hint" class="hint-text">Open a PDF to begin.</span>
+  <span class="spacer"></span>
+  <span class="pager">
+    <button class="mini" id="btnPrev" title="Previous page"><svg><use href="#i-up"/></svg></button>
+    <input id="pageInput" type="text" inputmode="numeric" value="0" aria-label="Current page">
+    <span id="pageCount">/ 0</span>
+    <button class="mini" id="btnNext" title="Next page"><svg><use href="#i-down"/></svg></button>
+  </span>
+</footer>
+
+<div class="findbar" id="findbar" hidden>
+  <div class="find-row">
+    <input id="findInput" type="text" placeholder="Find in document" autocomplete="off">
+    <span id="findCount" class="find-count"></span>
+    <button class="mini" id="findPrev" title="Previous (Shift+Enter)"><svg><use href="#i-up"/></svg></button>
+    <button class="mini" id="findNext" title="Next (Enter)"><svg><use href="#i-down"/></svg></button>
+    <button class="mini" id="findClose" title="Close (Esc)"><svg><use href="#i-close"/></svg></button>
+  </div>
+  <div class="find-row">
+    <input id="replaceInput" type="text" placeholder="Replace with" autocomplete="off">
+    <button class="btn small" id="replaceOne">Replace</button>
+    <button class="btn small" id="replaceAll">All</button>
+  </div>
+  <label class="check"><input type="checkbox" id="findCase"> Match case</label>
+</div>
+
+<div class="modal" id="signModal" hidden>
+  <div class="dialog sign-dialog" role="dialog" aria-labelledby="signTitle">
+    <div class="dialog-head">
+      <h2 id="signTitle">Add signature</h2>
+      <button class="mini" data-close><svg><use href="#i-close"/></svg></button>
+    </div>
+    <div class="seg" id="signTabs">
+      <button data-tab="draw" class="on">Draw</button>
+      <button data-tab="type">Type</button>
+      <button data-tab="saved">Saved</button>
+    </div>
+    <div class="sign-pane" data-pane="draw">
+      <canvas id="signPad" width="1200" height="400"></canvas>
+      <div class="sign-tools">
+        <span class="swatches" id="signColors">
+          <button data-c="#111111" class="on" style="--c:#111111" title="Black"></button>
+          <button data-c="#1a3fb8" style="--c:#1a3fb8" title="Blue"></button>
+          <button data-c="#b3261e" style="--c:#b3261e" title="Red"></button>
+        </span>
+        <button class="btn small" id="signClear">Clear</button>
+      </div>
+    </div>
+    <div class="sign-pane" data-pane="type" hidden>
+      <input id="signText" type="text" placeholder="Type your name" autocomplete="name">
+      <div class="sign-preview" id="signPreview">Your Name</div>
+    </div>
+    <div class="sign-pane" data-pane="saved" hidden>
+      <div id="savedSigs" class="saved-sigs"></div>
+    </div>
+    <div class="dialog-foot">
+      <label class="check"><input type="checkbox" id="signRemember" checked> Remember on this computer</label>
+      <span class="spacer"></span>
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="signPlace">Place signature</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="askModal" hidden>
+  <div class="dialog ask-dialog" role="dialog" aria-labelledby="askTitle">
+    <h2 id="askTitle"></h2>
+    <p id="askMsg"></p>
+    <div class="dialog-foot" id="askBtns"></div>
+  </div>
+</div>
+
+<div class="drop-overlay" id="dropOverlay" hidden><div>Drop PDF to open</div></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<input type="file" id="fileOpen" accept="application/pdf,.pdf" hidden>
+<input type="file" id="fileMerge" accept="application/pdf,.pdf" multiple hidden>
+<input type="file" id="fileImage" accept="image/*" hidden>
+<input type="file" id="fileFont" accept=".ttf,.otf,font/ttf,font/otf" hidden>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/pdf-lib.min.js"></script>
+<script src="vendor/fontkit.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
