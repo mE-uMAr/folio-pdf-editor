@@ -38,6 +38,7 @@
     <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
     <symbol id="i-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-cut" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="1"/><path d="M4 9.5h16M4 14.5h16M8 12h8"/></symbol>
     <symbol id="i-front" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="1"/><path d="M15 9V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h4"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><rect x="4" y="4" width="11" height="11" rx="1"/><path d="M15 9h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-4"/></symbol>
   </defs>
@@ -69,6 +70,10 @@
     <button class="tb icon" id="btnZoomIn" title="Zoom in (Ctrl++)"><svg><use href="#i-plus"/></svg></button>
   </div>
   <div class="tb-group">
+    <button class="tb" id="fxBw" title="Black &amp; white filter (applied when saving)" disabled><span>B&amp;W</span></button>
+    <button class="tb" id="fxScan" title="Scanned-paper filter (applied when saving). Combine with B&amp;W for a black &amp; white scan" disabled><span>Scanned</span></button>
+  </div>
+  <div class="tb-group">
     <button class="tb icon" id="btnFind" title="Find &amp; replace (Ctrl+F)" disabled><svg><use href="#i-find"/></svg></button>
   </div>
   <div class="spacer"></div>
@@ -82,6 +87,7 @@
     <button class="tool" data-tool="edit" title="Edit existing text (E)"><svg><use href="#i-edit"/></svg></button>
     <button class="tool" data-tool="text" title="Add text (T)"><svg><use href="#i-text"/></svg></button>
     <div class="rail-sep"></div>
+    <button class="tool" data-tool="cut" title="Delete table row / strip (X)"><svg><use href="#i-cut"/></svg></button>
     <button class="tool" data-tool="whiteout" title="Whiteout / redact area (W)"><svg><use href="#i-whiteout"/></svg></button>
     <button class="tool" data-tool="highlight" title="Highlight (H)"><svg><use href="#i-highlight"/></svg></button>
     <button class="tool" data-tool="draw" title="Freehand draw (D)"><svg><use href="#i-draw"/></svg></button>
@@ -168,13 +174,26 @@
       <button data-tab="saved">Saved</button>
     </div>
     <div class="sign-pane" data-pane="draw">
-      <canvas id="signPad" width="1200" height="400"></canvas>
+      <div class="sign-board" id="signBoard"><canvas id="signPad" width="1800" height="600"></canvas></div>
       <div class="sign-tools">
-        <span class="swatches" id="signColors">
-          <button data-c="#111111" class="on" style="--c:#111111" title="Black"></button>
-          <button data-c="#1a3fb8" style="--c:#1a3fb8" title="Blue"></button>
-          <button data-c="#b3261e" style="--c:#b3261e" title="Red"></button>
+        <span class="seg" id="signPens">
+          <button data-pen="ballpoint" class="on">Ballpoint</button>
+          <button data-pen="marker">Marker</button>
         </span>
+        <span class="swatches" id="signColors">
+          <button data-c="#16161d" class="on" style="--c:#16161d" title="Black"></button>
+          <button data-c="#1d3fae" style="--c:#1d3fae" title="Blue"></button>
+          <button data-c="#b3261e" style="--c:#b3261e" title="Red"></button>
+          <button data-c="#1f6b3a" style="--c:#1f6b3a" title="Green"></button>
+          <input type="color" id="signColor" value="#16161d" title="Any colour" aria-label="Any ink colour">
+        </span>
+        <label class="sign-size">Tip <input type="range" id="signSize" min="0.6" max="1.8" step="0.1" value="1" aria-label="Tip size"></label>
+        <label class="check" title="Steady the line: removes the small wobbles of drawing on a screen, keeps corners"><input type="checkbox" id="signSmooth" checked> Steady line</label>
+        <span class="sign-zoom" title="Zoom the board (pinch with two fingers, or Ctrl + wheel)">
+          <button class="btn small" id="signZoomOut" aria-label="Zoom out">&minus;</button><span id="signZoomVal">100%</span><button class="btn small" id="signZoomIn" aria-label="Zoom in">+</button>
+        </span>
+        <span class="spacer"></span>
+        <button class="btn small" id="signUndo">Undo stroke</button>
         <button class="btn small" id="signClear">Clear</button>
       </div>
     </div>

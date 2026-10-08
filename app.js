@@ -49,7 +49,7 @@ const STD_FONTS = {
 
 const S = {
   sources: [], pages: [], zoom: 1, zoomMode: 'fitw', tool: 'select', sel: null, editing: null,
-  fileName: 'document.pdf', fileHandle: null, images: {}, dirty: false, clip: null,
+  fileName: 'document.pdf', fileHandle: null, images: {}, dirty: false, clip: null, fx: { bw: false, scan: false },
   defaults: {
     text: { font: 'Helvetica', size: 14, bold: false, italic: false, underline: false, color: '#111111', align: 'left', opacity: 1 },
     whiteout: { fill: '#ffffff', stroke: null, sw: 1, opacity: 1 },
@@ -59,11 +59,12 @@ const S = {
     line: { stroke: '#d93025', sw: 2, opacity: 1, arrow: false },
     arrow: { stroke: '#d93025', sw: 2, opacity: 1, arrow: true },
     draw: { stroke: '#1a3fb8', sw: 2, opacity: 1 },
+    cut: { close: true },
   },
 };
 // runtime caches (never part of undo history)
 const RT = {
-  models: new Map(), libDocs: new Map(), fonts: new Map(), customFonts: new Map(),
+  models: new Map(), libDocs: new Map(), fonts: new Map(), customFonts: new Map(), geoms: new Map(),
   previews: new Map(), imgUrls: new Map(), baselines: new Map(), observer: null, thumbObserver: null,
 };
 
@@ -127,7 +128,7 @@ function restore(s) {
   S.pages = JSON.parse(s);
   if (S.sel && !findObj(S.sel)) S.sel = null;
   if (structKey() !== before) buildViewer();
-  else S.pages.forEach((pg) => { renderLayer(pg); refreshCanvas(pg); });
+  else S.pages.forEach((pg) => { renderLayer(pg); refreshCanvas(pg); if (S.tool === 'edit') renderHits(pg); });
   renderProps(); setDirty(true);
 }
 function undo() { endEdit(); if (H.i > 0) { H.i--; restore(H.stack[H.i]); updateUndo(); } }
@@ -153,13 +154,14 @@ async function openBytes(bytes, name, handle = null) {
     endEdit();
     for (const s of S.sources) s.doc.destroy();
     for (const p of RT.previews.values()) p.doc?.destroy?.();
-    Object.assign(RT, { models: new Map(), libDocs: new Map(), fonts: new Map(), previews: new Map() });
+    Object.assign(RT, { models: new Map(), libDocs: new Map(), fonts: new Map(), previews: new Map(), geoms: new Map() });
     S.sources = []; S.images = {}; S.sel = null;
+    setFx('bw', false, true); setFx('scan', false, true);
     S.pages = await loadSource(bytes, name);
     S.fileName = name; S.fileHandle = handle;
     $('#fileName').textContent = name; document.title = name + ' — Folio';
     $('#welcome').hidden = true;
-    ['#btnMerge', '#btnSave', '#btnSaveAs', '#btnFind', '#btnAddPage'].forEach((s) => ($(s).disabled = false));
+    ['#btnMerge', '#btnSave', '#btnSaveAs', '#btnFind', '#btnAddPage', '#fxBw', '#fxScan'].forEach((s) => ($(s).disabled = false));
     S.zoomMode = 'fitw'; S.zoom = computeFitZoom('fitw');
     buildViewer(); resetHistory(); setDirty(false); renderProps();
     $('#viewport').scrollTop = 0;
@@ -264,6 +266,7 @@ async function buildModel(pg) {
         const sk = [st.font, Tfs, st.Tc, st.Tw, st.Th, st.rise, st.fill, st.stroke, st.Tr, st.lw].join('|');
         if (!styleIndex.has(sk)) { styleIndex.set(sk, styles.length); styles.push({ font: st.font, Tfs, Tc: st.Tc, Tw: st.Tw, Th: st.Th, rise: st.rise, fill: st.fill, stroke: st.stroke, Tr: st.Tr, lw: st.lw }); }
         const si = styleIndex.get(sk);
+        const Tm0 = Tm;
         let x = 0;
         for (const g of arr) {
           if (typeof g === 'number') { x += (-g * Tfs) / 1000; continue; }
@@ -277,7 +280,7 @@ async function buildModel(pg) {
           });
           x += cw;
         }
-        if (op >= 0) shows[op] = { Tfs, x };
+        if (op >= 0) shows[op] = { Tfs, x, Th: st.Th, ctm: st.ctm, Tm: Tm0, Tlm };
         Tm = mul(Tm, [1, 0, 0, 1, x * st.Th, 0]);
         break;
       }
@@ -582,7 +585,7 @@ function unitsBBox(model, units, vp) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 function tlineFor(pg, key) { return pg.objects.find((o) => o.type === 'tline' && o.key === key); }
-const tlineSig = (pg) => JSON.stringify(pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o.text, o.bg]));
+const tlineSig = (pg) => JSON.stringify([pg.src, pg.index, ...pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o.text, o.bg])]);
 
 /* ================================================================ CONTENT STREAM SURGERY */
 function contentBytes(page) {
@@ -631,6 +634,16 @@ function scanShowOps(b) {
   }
   return res;
 }
+function goneShow(bytes, op, sh) {
+  const num = sh && sh.Tfs ? (-sh.x * 1000) / sh.Tfs : 0;
+  const rep = `[${num.toFixed(4)}] TJ`;
+  if (op.op === "'") return 'T* ' + rep;
+  if (op.op === '"') {
+    const nums = new TextDecoder('latin1').decode(bytes.subarray(op.start, op.end)).match(/[+-]?(\d+\.?\d*|\.\d+)/g) || ['0', '0'];
+    return `${nums[0]} Tw ${nums[1]} Tc T* ` + rep;
+  }
+  return rep;
+}
 // Replace the selected show operators with pure advances: glyphs vanish, following text stays put.
 function removeShowOps(doc, page, model, removeSet) {
   const bytes = contentBytes(page);
@@ -641,15 +654,7 @@ function removeShowOps(doc, page, model, removeSet) {
   let last = 0;
   ops.forEach((op, k) => {
     if (!removeSet.has(k)) return;
-    const sh = model.shows[k];
-    const num = sh && sh.Tfs ? (-sh.x * 1000) / sh.Tfs : 0;
-    let rep = `[${num.toFixed(4)}] TJ`;
-    if (op.op === "'") rep = 'T* ' + rep;
-    else if (op.op === '"') {
-      const nums = new TextDecoder('latin1').decode(bytes.subarray(op.start, op.end)).match(/[+-]?(\d+\.?\d*|\.\d+)/g) || ['0', '0'];
-      rep = `${nums[0]} Tw ${nums[1]} Tc T* ` + rep;
-    }
-    chunks.push(bytes.subarray(last, op.start), enc.encode(' ' + rep + ' '));
+    chunks.push(bytes.subarray(last, op.start), enc.encode(' ' + goneShow(bytes, op, model.shows[k]) + ' '));
     last = op.end;
   });
   chunks.push(bytes.subarray(last));
@@ -671,6 +676,246 @@ function wrapContents(doc, page) {
   const cur = ctx.lookup(c);
   const arr = cur instanceof PDFLib.PDFArray ? cur.asArray() : [c];
   page.node.set(PDFName.of('Contents'), ctx.obj([q, ...arr, Q]));
+}
+
+/* ================================================================ STRIP REMOVAL (table rows)
+ * Deleting a row is structural: everything inside a horizontal strip is taken out of the content stream
+ * (text, cell borders, images) and what lies below moves up to close the gap. The result becomes the
+ * page's new source, so the text model, hit regions and later edits all see the page as it now is. */
+const PATH_ARGS = { m: 2, l: 2, c: 6, v: 4, y: 4, re: 4, h: 0 };
+const PAINT_OPS = new Set(['S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n']);
+const fnum = (v) => String(+v.toFixed(4));
+
+// Tokenise a content stream into operators with their operands and byte ranges.
+function parseOps(b) {
+  const ops = [];
+  const n = b.length;
+  let i = 0, args = [], start = -1;
+  const ws = (c) => c === 0 || c === 9 || c === 10 || c === 12 || c === 13 || c === 32;
+  const delim = (c) => c === 40 || c === 41 || c === 60 || c === 62 || c === 91 || c === 93 || c === 123 || c === 125 || c === 47 || c === 37;
+  const push = (s, v) => { if (start < 0) start = s; args.push({ s, v }); };
+  const str = () => { let d = 1; i++; while (i < n && d > 0) { const x = b[i]; if (x === 92) { i += 2; continue; } if (x === 40) d++; else if (x === 41) d--; i++; } };
+  while (i < n) {
+    const c = b[i];
+    if (ws(c)) { i++; continue; }
+    if (c === 37) { while (i < n && b[i] !== 10 && b[i] !== 13) i++; continue; }
+    const t0 = i;
+    if (c === 40) { str(); push(t0, null); continue; }
+    if (c === 60 && b[i + 1] !== 60) { while (i < n && b[i] !== 62) i++; i++; push(t0, null); continue; }
+    if (c === 60 || c === 91) { // dictionary or array operand: skip to its matching close
+      let d = 0;
+      while (i < n) {
+        const x = b[i];
+        if (x === 40) { str(); continue; }
+        if (x === 91) d++; else if (x === 93) d--;
+        else if (x === 60 && b[i + 1] === 60) { d++; i++; } else if (x === 62 && b[i + 1] === 62) { d--; i++; }
+        i++;
+        if (d <= 0) break;
+      }
+      push(t0, null); continue;
+    }
+    if (c === 62 || c === 93 || c === 41 || c === 123 || c === 125) { i++; continue; }
+    if (c === 47) { i++; while (i < n && !ws(b[i]) && !delim(b[i])) i++; let s = ''; for (let k = t0 + 1; k < i; k++) s += String.fromCharCode(b[k]); push(t0, s); continue; }
+    while (i < n && !ws(b[i]) && !delim(b[i])) i++;
+    let tok = '';
+    for (let k = t0; k < i && k - t0 < 40; k++) tok += String.fromCharCode(b[k]);
+    if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(tok)) { push(t0, parseFloat(tok)); continue; }
+    if (tok === 'true' || tok === 'false' || tok === 'null') { push(t0, null); continue; }
+    if (tok === 'BI') { // inline image: skip binary payload
+      let j = i;
+      while (j < n - 2 && !(ws(b[j]) && b[j + 1] === 73 && b[j + 2] === 68 && (j + 3 >= n || ws(b[j + 3])))) j++;
+      j += 4;
+      while (j < n - 2 && !(ws(b[j]) && b[j + 1] === 69 && b[j + 2] === 73 && (j + 3 >= n || ws(b[j + 3]) || delim(b[j + 3])))) j++;
+      i = Math.min(n, j + 3);
+    }
+    ops.push({ op: tok, start: start < 0 ? t0 : start, opStart: t0, end: i, args });
+    args = []; start = -1;
+  }
+  return ops;
+}
+// Painted paths, text-show operators, XObjects and inline images in stream order, each with its CTM.
+function walkContent(b) {
+  const items = [], stack = [];
+  let ctm = I, path = null, k = 0;
+  for (const o of parseOps(b)) {
+    switch (o.op) {
+      case 'q': stack.push(ctm); break;
+      case 'Q': if (stack.length) ctm = stack.pop(); break;
+      case 'cm': { const m = o.args.slice(-6).map((a) => a.v); if (m.length === 6 && m.every(Number.isFinite)) ctm = mul(ctm, m); break; }
+      case 'BT': case 'Tm': items.push({ kind: 'reset' }); break;
+      case 'Tj': case 'TJ': case "'": case '"': items.push({ kind: 'show', o, k: k++ }); break;
+      case 'Do': case 'BI': items.push({ kind: 'xobj', o, ctm, name: o.op === 'Do' ? o.args[o.args.length - 1]?.v : null }); break;
+      case 'W': case 'W*': if (path) path.clip = true; break;
+      default:
+        if (o.op in PATH_ARGS) {
+          if (!path) path = { kind: 'path', ctm, segs: [], clip: false, start: o.start };
+          path.segs.push(o);
+        } else if (PAINT_OPS.has(o.op) && path) { path.end = o.end; path.paint = o.op; items.push(path); path = null; }
+    }
+  }
+  return items;
+}
+function segPts(o) {
+  const need = PATH_ARGS[o.op];
+  const v = o.args.slice(-need).map((a) => a.v);
+  if (!need || v.length < need || !v.every(Number.isFinite)) return [];
+  if (o.op === 're') return [[v[0], v[1]], [v[0] + v[2], v[1]], [v[0] + v[2], v[1] + v[3]], [v[0], v[1] + v[3]]];
+  const pts = [];
+  for (let i = 0; i < need; i += 2) pts.push([v[i], v[i + 1]]);
+  return pts;
+}
+function xobjBox(page, name) {
+  try {
+    const d = name && page.node.Resources()?.lookup(PDFName.of('XObject'))?.lookup(PDFName.of(name))?.dict;
+    if (d && d.get(PDFName.of('Subtype')) === PDFName.of('Form')) {
+      const mt = d.lookup(PDFName.of('Matrix'));
+      return { box: d.lookup(PDFName.of('BBox')).asArray().map((x) => x.asNumber()), m: mt ? mt.asArray().map((x) => x.asNumber()) : I };
+    }
+  } catch {}
+  return { box: [0, 0, 1, 1], m: I };
+}
+// Remove the strip a…b (display points, top to bottom) from a page; with `close`, pull up what is below it.
+function cutPageBand(doc, page, pg, model, a, b, close) {
+  const bytes = contentBytes(page);
+  const items = walkContent(bytes);
+  if (items.filter((x) => x.kind === 'show').length !== model.showCount) throw new Error('this page has text the editor cannot restructure');
+  const vp = viewportFor(pg, 1), ivp = invertM(vp);
+  const h = close ? b - a : 0, tol = 0.5;
+  const up = [1, 0, 0, 1, -h * ivp[2], -h * ivp[3]]; // the upward move, in page space
+  const moved = (ctm, m) => mul(invertM(ctm), mul(up, mul(ctm, m)));
+  const src = (s, e) => new TextDecoder('latin1').decode(bytes.subarray(s, e));
+  const edits = [];
+  const put = (s, e, text) => edits.push({ s, e, text: ' ' + text + ' ' });
+  let shifted = false; // are the stream's current text matrices displaced by `up`?
+  for (const it of items) {
+    if (it.kind === 'reset') { shifted = false; continue; }
+    if (it.kind === 'show') {
+      const sh = model.shows[it.k], o = it.o;
+      if (!sh) continue;
+      const U = mul(sh.ctm, sh.Tm);
+      const y = apply(vp, U[4], U[5])[1];
+      if (y > a && y <= b) { put(o.start, o.end, goneShow(bytes, o, sh)); continue; }
+      const want = close && y > b;
+      if (want === shifted || (o.op === '"' && o.args.length < 3)) continue;
+      shifted = want;
+      // re-seat the line matrix, then re-apply the advance already made on this line
+      const L = sh.Tlm, tx = ((sh.Tm[4] - L[4]) * L[0] + (sh.Tm[5] - L[5]) * L[1]) / (L[0] * L[0] + L[1] * L[1] || 1);
+      let pre = (want ? moved(sh.ctm, L) : L).map(fnum).join(' ') + ' Tm';
+      if (Math.abs(tx) > 1e-6 && sh.Tfs * sh.Th) pre += ` [${fnum((-tx * 1000) / (sh.Tfs * sh.Th))}] TJ`;
+      if (o.op === "'") put(o.start, o.end, `T* ${pre} ${src(o.start, o.opStart)} Tj`);
+      else if (o.op === '"') put(o.start, o.end, `${fnum(o.args[0].v || 0)} Tw ${fnum(o.args[1].v || 0)} Tc T* ${pre} ${src(o.args[2].s, o.opStart)} Tj`);
+      else put(o.start, o.start, pre);
+      continue;
+    }
+    if (it.kind === 'xobj') {
+      const { box, m } = xobjBox(page, it.name);
+      const D = mul(vp, mul(it.ctm, m));
+      const ys = [[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]].map(([x, y]) => apply(D, x, y)[1]);
+      const top = Math.min(...ys), bot = Math.max(...ys);
+      if (top >= a - tol && bot <= b + tol) put(it.o.start, it.o.end, '');
+      else if (close && top >= b - tol) put(it.o.start, it.o.end, `q ${moved(it.ctm, I).map(fnum).join(' ')} cm ${src(it.o.start, it.o.end)} Q`);
+      continue;
+    }
+    // paths: vertices below the strip move up, vertices inside it collapse onto its top edge
+    const D = mul(vp, it.ctm), Di = invertM(D);
+    const segs = it.segs.map((o) => ({ o, pts: segPts(o) }));
+    const ys = segs.flatMap((s) => s.pts.map(([x, y]) => apply(D, x, y)[1]));
+    if (!ys.length) continue;
+    const top = Math.min(...ys), bot = Math.max(...ys), mid = (top + bot) / 2;
+    const inside = bot - top < 2 * tol ? mid >= a - tol && mid < b - tol : top >= a - tol && bot <= b + tol;
+    if (inside) { if (!it.clip) put(it.start, it.end, ''); continue; }
+    if (!close || bot <= a + tol) continue;
+    const mp = (p) => { const [X, Y] = apply(D, p[0], p[1]); return Y <= a ? p : apply(Di, X, Y >= b ? Y - h : a); };
+    const axis = (Math.abs(D[1]) < 1e-6 && Math.abs(D[2]) < 1e-6) || (Math.abs(D[0]) < 1e-6 && Math.abs(D[3]) < 1e-6);
+    for (const { o, pts } of segs) {
+      const np = pts.map(mp);
+      if (!np.length || np.every((q, i) => q === pts[i])) continue;
+      if (o.op !== 're') put(o.start, o.end, np.flat().map(fnum).join(' ') + ' ' + o.op);
+      else if (axis) put(o.start, o.end, [np[0][0], np[0][1], np[2][0] - np[0][0], np[2][1] - np[0][1]].map(fnum).join(' ') + ' re');
+      else put(o.start, o.end, np.map((q, i) => `${fnum(q[0])} ${fnum(q[1])} ${i ? 'l' : 'm'}`).join(' ') + ' h');
+    }
+  }
+  const enc = new TextEncoder();
+  const chunks = [];
+  let last = 0;
+  for (const e of edits) { chunks.push(bytes.subarray(last, e.s), enc.encode(e.text)); last = e.e; }
+  chunks.push(bytes.subarray(last));
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let p = 0;
+  for (const c of chunks) { out.set(c, p); p += c.length; }
+  page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(out)));
+}
+// Cell rectangles, horizontal rules and text-line boxes (display points) used to find the row under the pointer.
+async function getGeom(pg) {
+  const key = `${pg.src}:${pg.index}:${R(pg)}`;
+  if (!RT.geoms.has(key)) RT.geoms.set(key, (async () => {
+    const vp = viewportFor(pg, 1);
+    const rects = [], rules = [];
+    const page = (await getLibDoc(pg.src)).getPage(pg.index);
+    for (const it of walkContent(contentBytes(page))) {
+      if (it.kind !== 'path' || it.clip || it.paint === 'n') continue;
+      const D = mul(vp, it.ctm);
+      const pts = it.segs.flatMap(segPts).map(([x, y]) => apply(D, x, y));
+      if (!pts.length) continue;
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      const r = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
+      if (r.h < 1.5) { if (r.w >= 10) rules.push(r); } else if (r.w >= 4 && r.h >= 4 && r.h <= 150) rects.push(r);
+    }
+    const model = await getModel(pg);
+    const texts = model.lines.filter((l) => l.editable).map((l) => unitsBBox(model, l.units, vp));
+    return { rects, rules, texts };
+  })().catch((e) => { console.warn(e); return { rects: [], rules: [], texts: [] }; }));
+  return RT.geoms.get(key);
+}
+// The row under a point: its table cell, else the gap between two rules, else the text line.
+function detectBand(g, p) {
+  const has = (r) => p.x >= r.x && p.x <= r.x + r.w;
+  let cell = null;
+  for (const r of g.rects) if (has(r) && p.y >= r.y && p.y <= r.y + r.h && (!cell || r.h < cell.h)) cell = r;
+  if (cell) return { a: cell.y, b: cell.y + cell.h };
+  let up = -Infinity, dn = Infinity;
+  for (const r of g.rules) {
+    if (!has(r)) continue;
+    const y = r.y + r.h / 2;
+    if (y <= p.y) up = Math.max(up, y); else dn = Math.min(dn, y);
+  }
+  if (dn - up >= 4 && dn - up <= 150) return { a: up, b: dn };
+  const t = g.texts.find((r) => has(r) && p.y >= r.y && p.y <= r.y + r.h) || g.texts.find((r) => p.y >= r.y && p.y <= r.y + r.h);
+  return t ? { a: t.y - 1, b: t.y + t.h + 1 } : null;
+}
+async function isolatePage(src, index) {
+  const doc = await PDFDocument.create();
+  doc.registerFontkit(fontkit);
+  const [p] = await doc.copyPages(await getLibDoc(src), [index]);
+  doc.addPage(p);
+  return { doc, p };
+}
+async function deleteBand(pg, a, b) {
+  endEdit();
+  if (pg.blank || b - a < 1) return;
+  try {
+    let at = pg;
+    if (pg.objects.some((o) => o.type === 'tline')) {
+      // bake pending text edits first, so the strip is cut from the page as it currently looks
+      const { doc, p } = await isolatePage(pg.src, pg.index);
+      await applyTextEdits(doc, p, pg, new Map(), null);
+      [at] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
+    }
+    const { doc, p } = await isolatePage(at.src, at.index);
+    cutPageBand(doc, p, pg, await getModel(at), a, b, S.defaults.cut.close);
+    const [np] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
+    const moveUp = S.defaults.cut.close ? pg.objects.filter((o) => o.type !== 'tline' && objBBox(o, pg).y >= b - 0.5) : [];
+    pg.src = np.src; pg.index = np.index;
+    pg.objects = pg.objects.filter((o) => o.type !== 'tline');
+    for (const o of moveUp) translateObj(o, JSON.parse(JSON.stringify(o)), 0, a - b);
+    if (S.sel && !findObj(S.sel)) S.sel = null;
+    RT.previews.delete(pg.id);
+    commit();
+    renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
+  } catch (e) {
+    console.error(e);
+    toast('Could not delete this strip: ' + e.message, 5000);
+  }
 }
 
 /* ---- draw glyphs with exact matrices ---- */
@@ -901,9 +1146,14 @@ async function renderHits(pg) {
   const vp = viewportFor(pg, 1);
   const z = S.zoom;
   hits.innerHTML = '';
+  const edits = new Map(pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o]));
+  const repeats = new Map();
+  for (const ln of model.lines) repeats.set(ln.text, (repeats.get(ln.text) || 0) + 1);
+  const under = [], over = [];
   for (const ln of model.lines) {
     if (!ln.editable) continue;
-    const t = tlineFor(pg, ln.key);
+    const t = edits.get(ln.key);
+    if (t && !t.text.trim()) continue; // deleted text is gone, not an empty field
     const units = t ? layoutLine(model, ln, t.text) : ln.units;
     const ref = ln.units.find((u) => !u.syn) || ln.units[0];
     if (!isHorizontalInDisplay(pg, ref.M)) continue;
@@ -911,8 +1161,9 @@ async function renderHits(pg) {
     const d = document.createElement('div');
     d.className = 'hit'; d.dataset.key = ln.key;
     Object.assign(d.style, { left: (bb.x - 1) * z + 'px', top: (bb.y - 1) * z + 'px', width: (bb.w + 2) * z + 'px', height: (bb.h + 2) * z + 'px' });
-    hits.appendChild(d);
+    (repeats.get(ln.text) >= 4 ? under : over).push(d);
   }
+  hits.append(...under, ...over);
 }
 function isHorizontalInDisplay(pg, M) {
   const d = mul(viewportFor(pg, 1), M);
@@ -959,7 +1210,7 @@ function makeObjEl(o, pg) {
       Object.assign(el.style, { borderRadius: '50%', background: o.fill || 'transparent', border: o.stroke ? `${o.sw * z}px solid ${o.stroke}` : '0', opacity: o.opacity });
       break;
     case 'image':
-      el.className = 'obj image'; box(o.x, o.y, o.w, o.h); el.style.opacity = o.opacity;
+      el.className = 'obj image' + (o.ink ? ' ink' : ''); box(o.x, o.y, o.w, o.h); el.style.opacity = o.opacity;
       el.innerHTML = `<img alt="" draggable="false" src="${imgUrl(o.img)}">`;
       break;
     case 'line': case 'path': {
@@ -1012,7 +1263,7 @@ async function renderLayer(pg) {
     const stale = el._renderedSig !== tlineSig(pg);
     for (const o of tlines) {
       const line = model.lines[o.key];
-      if (!line) continue;
+      if (!line || (!o.text.trim() && S.editing !== o.id)) continue;
       const units = layoutLine(model, line, o.text);
       const bb = unitsBBox(model, units.length ? units : line.units, vp);
       const obb = unitsBBox(model, line.units, vp);
@@ -1235,9 +1486,10 @@ function placeCaret(el, ev) {
 }
 function finishLineEdit(pg, o, line, ed) {
   o.text = ed.textContent.replace(/\n/g, ' ');
+  if (!o.text.trim()) o.text = '';
   S.editing = null;
   if (o.text === line.text) pg.objects = pg.objects.filter((x) => x !== o);
-  if (S.sel === o.id && !pg.objects.includes(o)) S.sel = null;
+  if (S.sel === o.id && (!o.text || !pg.objects.includes(o))) S.sel = null;
   commit();
   renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
 }
@@ -1314,6 +1566,11 @@ $('#pages').addEventListener('pointerdown', async (e) => {
   e.preventDefault();
   endEdit();
   if (tool === 'select' || tool === 'edit') { select(null); return; }
+  if (tool === 'cut') {
+    drag = { kind: 'cut', pg, start: p, el };
+    el.setPointerCapture(e.pointerId);
+    return;
+  }
   if (tool === 'text') {
     const d = S.defaults.text;
     const o = { id: uid(), type: 'text', x: p.x, y: p.y - d.size * 0.6, text: '', ...d };
@@ -1350,9 +1607,10 @@ let rafPending = false;
 function schedule(fn) { if (rafPending) return; rafPending = true; requestAnimationFrame(() => { rafPending = false; fn(); }); }
 
 $('#pages').addEventListener('pointermove', (e) => {
-  if (!drag) return;
+  if (!drag) { if (S.tool === 'cut') hoverBand(e); return; }
   const p = ptIn(drag.el, e);
   const { pg, o } = drag;
+  if (drag.kind === 'cut') { if (Math.abs(p.y - drag.start.y) > 3) showBand(drag.el, Math.min(p.y, drag.start.y), Math.max(p.y, drag.start.y)); return; }
   if (drag.kind === 'move') {
     let dx = p.x - drag.start.x, dy = p.y - drag.start.y;
     if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
@@ -1382,6 +1640,14 @@ $('#pages').addEventListener('pointerup', async (e) => {
   if (!drag) return;
   const d = drag; drag = null;
   const { pg } = d;
+  if (d.kind === 'cut') {
+    const p = ptIn(d.el, e);
+    const band = Math.abs(p.y - d.start.y) > 3 ? { a: Math.min(p.y, d.start.y), b: Math.max(p.y, d.start.y) } : pg.blank ? null : detectBand(await getGeom(pg), p);
+    clearBand();
+    if (band) await deleteBand(pg, band.a, band.b);
+    else toast('No row found here. Drag to mark the strip to delete.');
+    return;
+  }
   if (d.kind === 'create') {
     d.rect.remove();
     const p = ptIn(d.el, e);
@@ -1414,6 +1680,27 @@ $('#pages').addEventListener('pointerup', async (e) => {
     commit(); renderLayer(pg); renderProps();
   }
 });
+
+/* ---- delete-row tool: preview of the strip that a click would remove ---- */
+let bandEl = null;
+function showBand(el, a, b) {
+  if (!bandEl) { bandEl = document.createElement('div'); bandEl.className = 'cut-band'; }
+  const marks = el.querySelector('.marks');
+  if (bandEl.parentNode !== marks) marks.appendChild(bandEl);
+  Object.assign(bandEl.style, { top: a * S.zoom + 'px', height: (b - a) * S.zoom + 'px' });
+}
+function clearBand() { bandEl?.remove(); }
+async function hoverBand(e) {
+  const el = e.target.closest('.page');
+  const pg = el && pageById(el.dataset.id);
+  if (!pg || pg.blank) { clearBand(); return; }
+  const p = ptIn(el, e);
+  const g = await getGeom(pg);
+  if (S.tool !== 'cut' || drag || !el.isConnected) return;
+  const band = detectBand(g, p);
+  if (band) showBand(el, band.a, band.b); else clearBand();
+}
+$('#pages').addEventListener('pointerleave', () => { if (!drag) clearBand(); });
 
 function normRect(a, b) { return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y) }; }
 function translateObj(o, orig, dx, dy) {
@@ -1468,6 +1755,7 @@ const HINTS = {
   edit: 'Click any line of existing text to edit it in its original font, size and colour. Enter to finish, Esc to cancel.',
   text: 'Click to add a text box. Shift+Enter for a new line while typing.',
   whiteout: 'Drag to cover an area with a solid box.',
+  cut: 'Click a table row or a line to delete it and close the gap. Drag to mark any strip. Ctrl+Z brings it back.',
   highlight: 'Drag across text to highlight it; click a line to highlight all of it.',
   rect: 'Drag to draw a rectangle. Shift keeps it square after placement.',
   ellipse: 'Drag to draw an ellipse.',
@@ -1481,6 +1769,7 @@ function setTool(t) {
   if (t === 'image') { $('#fileImage').click(); return; }
   if (t === 'sign') { if (S.pages.length) openSign(); return; }
   endEdit();
+  clearBand();
   S.tool = t;
   $$('.tool').forEach((b) => b.classList.toggle('on', b.dataset.tool === t));
   const host = $('#pages');
@@ -1508,6 +1797,7 @@ function renderProps() {
   let h = '';
   if (o?.type === 'tline') h = tlineProps(f.pg, o);
   else if (o) h = objProps(o, false);
+  else if (S.tool === 'cut') h = cutProps();
   else if (S.defaults[S.tool]) h = objProps({ type: toolType(S.tool), ...S.defaults[S.tool], kind: S.tool }, true);
   else h = docProps();
   P.innerHTML = h;
@@ -1517,8 +1807,10 @@ function toolType(t) { return t === 'text' ? 'text' : t === 'ellipse' ? 'ellipse
 function docProps() {
   const n = S.pages.length;
   const edits = S.pages.reduce((a, p) => a + p.objects.length, 0);
+  const gone = S.pages.reduce((a, p) => a + p.objects.filter((o) => o.type === 'tline' && !o.text).length, 0);
   return `<div class="p-sec"><h3 class="p-title">Document</h3>
-    <p class="p-note"><b>${esc(S.fileName)}</b><br>${n} page${n > 1 ? 's' : ''} · ${edits} edit${edits === 1 ? '' : 's'}</p></div>
+    <p class="p-note"><b>${esc(S.fileName)}</b><br>${n} page${n > 1 ? 's' : ''} · ${edits} edit${edits === 1 ? '' : 's'}</p>
+    ${gone ? `<p class="p-note" style="margin-top:8px">${gone} deleted text line${gone > 1 ? 's' : ''}</p><div class="p-actions" style="margin-top:6px"><button class="btn small" data-act="restore-deleted">Restore deleted text</button></div>` : ''}</div>
     <div class="p-sec"><h3 class="p-title">Shortcuts</h3><ul class="tips">
       <li><kbd>E</kbd> Edit existing text</li><li><kbd>T</kbd> Add text</li><li><kbd>V</kbd> Select</li>
       <li><kbd>W</kbd> Whiteout</li><li><kbd>H</kbd> Highlight</li><li><kbd>D</kbd> Draw</li>
@@ -1530,7 +1822,15 @@ function tlineProps(pg, o) {
     <div id="tlInfo" class="p-note">Reading font…</div></div>
     <div class="p-sec"><div class="p-actions">
       <button class="btn small" data-act="edit-tline">Edit text</button>
-      <button class="btn small danger" data-act="revert">Revert to original</button></div></div>`;
+      <button class="btn small" data-act="revert">Revert to original</button></div></div>
+    <div class="p-sec"><div class="p-actions">
+      <button class="btn small danger" data-act="del-line">Delete text</button>
+      <button class="btn small danger" data-act="del-same" id="tlSame" hidden></button></div></div>`;
+}
+function cutProps() {
+  return `<div class="p-sec"><h3 class="p-title">Delete row</h3>
+    <p class="p-note">Click a table row or a line of text to remove it, borders included. Drag to mark any strip instead.</p>
+    <label class="check" style="margin-top:10px"><input type="checkbox" data-check="close" ${S.defaults.cut.close ? 'checked' : ''}> Close the gap (move what is below up)</label></div>`;
 }
 async function fillTlineInfo(pg, o) {
   const model = await getModel(pg);
@@ -1550,6 +1850,11 @@ async function fillTlineInfo(pg, o) {
       (fb.custom ? '' : `<p class="p-note">For a perfect match, load the full font file (e.g. from C:\\Windows\\Fonts).</p><button class="btn small" data-act="font-upload">Load ${esc(info?.psName?.split(/[-,]/)[0] || 'font')} font file…</button>`);
   }
   box.innerHTML = h;
+  // repeated text (watermarks, stamps): offer to remove every copy at once
+  let same = 0;
+  for (const p of S.pages) if (!p.blank) same += (await getModel(p)).lines.filter((l) => l.editable && l.text === line.text).length;
+  const btn = $('#tlSame');
+  if (btn && same > 1 && S.sel === o.id) { btn.textContent = `Delete all ${same} matching`; btn.hidden = false; }
 }
 function objProps(o, isDefault) {
   const title = isDefault ? ({ text: 'New text', whiteout: 'Whiteout', highlight: 'Highlight', rect: 'Rectangle', ellipse: 'Ellipse', line: 'Line', arrow: 'Arrow', draw: 'Pen' }[S.tool] || 'Tool') :
@@ -1646,7 +1951,18 @@ $('#props').addEventListener('click', (e) => {
   if (act === 'edit-tline' && f) editLine(f.pg, f.o.key, null);
   if (act === 'revert' && f) { f.pg.objects = f.pg.objects.filter((x) => x !== f.o); S.sel = null; commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); toast('Original text restored'); }
   if (act === 'font-upload') $('#fileFont').click();
+  if ((act === 'del-line' || act === 'del-same') && f) deleteLineText(f.pg, f.o.key, act === 'del-same');
+  if (act === 'restore-deleted') {
+    S.pages.forEach((pg) => {
+      if (!pg.objects.some((o) => o.type === 'tline' && !o.text)) return;
+      pg.objects = pg.objects.filter((o) => o.type !== 'tline' || o.text);
+      renderLayer(pg); refreshCanvas(pg); renderHits(pg);
+    });
+    commit(); renderProps(); toast('Deleted text restored');
+  }
 });
+// keep the line editor open while its Delete buttons are pressed, so the click still knows the line
+$('#props').addEventListener('mousedown', (e) => { if (S.editing && e.target.closest('[data-act^="del-"]')) e.preventDefault(); });
 
 /* ---- custom fonts ---- */
 $('#fileFont').addEventListener('change', async (e) => {
@@ -1674,10 +1990,32 @@ $('#fileFont').addEventListener('change', async (e) => {
 function deleteSelected() {
   const f = S.sel && findObj(S.sel);
   if (!f) return;
+  if (f.o.type === 'tline') { deleteLineText(f.pg, f.o.key, false); return; }
   f.pg.objects = f.pg.objects.filter((x) => x !== f.o);
   S.sel = null;
   commit(); renderLayer(f.pg); renderProps();
-  if (f.o.type === 'tline') { refreshCanvas(f.pg); renderHits(f.pg); toast('Original text restored'); }
+}
+// Remove a line of existing text from the page; with `matching`, every identical line in the document.
+async function deleteLineText(pg, key, matching) {
+  const text = (await getModel(pg)).lines[key]?.text;
+  if (text == null) return;
+  endEdit();
+  const touched = new Set();
+  for (const p of matching ? S.pages : [pg]) {
+    if (p.blank) continue;
+    const edits = new Map(p.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o]));
+    for (const ln of (await getModel(p)).lines) {
+      if (!ln.editable || (matching ? ln.text !== text : p !== pg || ln.key !== key)) continue;
+      let o = edits.get(ln.key);
+      if (!o) { o = { id: uid(), type: 'tline', key: ln.key, text: ln.text, bg: '#ffffff' }; p.objects.unshift(o); }
+      if (o.text) { o.text = ''; touched.add(p); }
+    }
+  }
+  S.sel = null;
+  commit();
+  for (const p of touched) { renderLayer(p); refreshCanvas(p); renderHits(p); }
+  renderProps();
+  toast(matching ? 'Matching text deleted on ' + touched.size + ' page' + (touched.size === 1 ? '' : 's') + ' · Ctrl+Z to undo' : 'Text deleted · Ctrl+Z to undo');
 }
 function cloneObj(o, off = 10) {
   const c = JSON.parse(JSON.stringify(o));
@@ -1711,7 +2049,7 @@ async function normalizeImage(file) {
   URL.revokeObjectURL(url);
   return { dataUrl, w: img.naturalWidth, h: img.naturalHeight };
 }
-function placeImage(dataUrl, w, h, maxFrac = 0.5) {
+function placeImage(dataUrl, w, h, maxFrac = 0.5, extra = {}) {
   const pg = currentPage();
   if (!pg) return;
   const id = uid();
@@ -1721,7 +2059,7 @@ function placeImage(dataUrl, w, h, maxFrac = 0.5) {
   const ow = w * scale, oh = h * scale;
   const vp = $('#viewport').getBoundingClientRect(), r = pageEl(pg.id).getBoundingClientRect();
   const cy = clamp((vp.top + vp.height / 2 - r.top) / S.zoom, oh / 2, H - oh / 2);
-  const o = { id: uid(), type: 'image', img: id, x: (W - ow) / 2, y: cy - oh / 2, w: ow, h: oh, opacity: 1 };
+  const o = { id: uid(), type: 'image', img: id, x: (W - ow) / 2, y: cy - oh / 2, w: ow, h: oh, opacity: 1, ...extra };
   pg.objects.push(o);
   setTool('select'); S.sel = o.id; commit(); renderLayer(pg); renderProps();
 }
@@ -1737,12 +2075,14 @@ document.addEventListener('paste', async (e) => {
   else if (S.clip) { e.preventDefault(); paste(); }
 });
 
-const SIG = { tab: 'draw', color: '#111111', strokes: [], saved: [], pick: -1 };
+const PAD_W = 1800, PAD_H = 600;
+const SIG = { tab: 'draw', pen: 'ballpoint', color: '#16161d', size: 1, smooth: true, zoom: 1, strokes: [], live: false, cache: null, cached: -1, saved: [], pick: -1 };
 function loadSaved() { try { SIG.saved = JSON.parse(localStorage.getItem('folio.sigs') || '[]'); } catch { SIG.saved = []; } }
 function storeSaved() { try { localStorage.setItem('folio.sigs', JSON.stringify(SIG.saved.slice(0, 6))); } catch {} }
 function openSign() {
   loadSaved();
   $('#signModal').hidden = false;
+  padZoom(1);
   showSignTab(SIG.saved.length ? 'saved' : 'draw');
   drawPad();
 }
@@ -1764,34 +2104,261 @@ $('#savedSigs').addEventListener('click', (e) => {
   if (s) { SIG.pick = +s.dataset.i; showSignTab('saved'); }
 });
 $('#signModal').addEventListener('click', (e) => { if (e.target.closest('[data-close]') || e.target === $('#signModal')) $('#signModal').hidden = true; });
-$('#signColors').addEventListener('click', (e) => {
-  const b = e.target.closest('button'); if (!b) return;
-  SIG.color = b.dataset.c;
-  $$('#signColors button').forEach((x) => x.classList.toggle('on', x === b));
-  $('#signPreview').style.color = SIG.color; drawPad();
-});
-$('#signText').addEventListener('input', (e) => { $('#signPreview').textContent = e.target.value || 'Your Name'; });
-$('#signClear').addEventListener('click', () => { SIG.strokes = []; drawPad(); });
-(() => {
-  const pad = $('#signPad');
-  let cur = null;
-  const pt = (e) => { const r = pad.getBoundingClientRect(); return [((e.clientX - r.left) / r.width) * pad.width, ((e.clientY - r.top) / r.height) * pad.height, e.pressure || 0.5]; };
-  pad.addEventListener('pointerdown', (e) => { cur = [pt(e)]; SIG.strokes.push(cur); pad.setPointerCapture(e.pointerId); drawPad(); });
-  pad.addEventListener('pointermove', (e) => { if (cur) { cur.push(pt(e)); drawPad(); } });
-  pad.addEventListener('pointerup', () => { cur = null; });
-})();
-function drawPad(ctx = $('#signPad').getContext('2d'), w = 1200, h = 400, bg = true) {
-  ctx.clearRect(0, 0, w, h);
-  if (bg) { ctx.strokeStyle = '#d8d8d8'; ctx.lineWidth = 2; ctx.setLineDash([10, 10]); ctx.beginPath(); ctx.moveTo(60, h * 0.75); ctx.lineTo(w - 60, h * 0.75); ctx.stroke(); ctx.setLineDash([]); }
-  ctx.strokeStyle = SIG.color; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  for (const s of SIG.strokes) {
-    for (let i = 1; i < s.length; i++) {
-      ctx.lineWidth = 3 + 5 * (s[i][2] ?? 0.5);
-      ctx.beginPath(); ctx.moveTo(s[i - 1][0], s[i - 1][1]); ctx.lineTo(s[i][0], s[i][1]); ctx.stroke();
-    }
-    if (s.length === 1) { ctx.beginPath(); ctx.arc(s[0][0], s[0][1], 3, 0, 7); ctx.fillStyle = SIG.color; ctx.fill(); }
-  }
+function setInkColor(c, from) {
+  SIG.color = c;
+  $$('#signColors button').forEach((x) => x.classList.toggle('on', x === from));
+  $('#signColor').value = c;
+  $('#signPreview').style.color = c; inkChanged();
 }
+$('#signColors').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setInkColor(b.dataset.c, b); });
+$('#signColor').addEventListener('input', (e) => setInkColor(e.target.value, null));
+$('#signPens').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  SIG.pen = b.dataset.pen;
+  $$('#signPens button').forEach((x) => x.classList.toggle('on', x === b));
+  inkChanged();
+});
+$('#signSize').addEventListener('input', (e) => { SIG.size = +e.target.value; inkChanged(); });
+$('#signUndo').addEventListener('click', () => { SIG.strokes.pop(); inkChanged(); });
+$('#signSmooth').addEventListener('change', (e) => { SIG.smooth = e.target.checked; inkChanged(); });
+// Zoom the board to write larger or finer; fx, fy is the spot (0…1 across the visible board) that stays put.
+function padZoom(z, fx = 0.5, fy = 0.5) {
+  const board = $('#signBoard'), pad = $('#signPad');
+  z = clamp(z, 1, 4);
+  const px = pad.offsetWidth ? (board.scrollLeft + fx * board.clientWidth) / pad.offsetWidth : 0.5, py = pad.offsetHeight ? (board.scrollTop + fy * board.clientHeight) / pad.offsetHeight : 0.5;
+  if (z > 1 && !board.style.height) board.style.height = pad.offsetHeight + 'px'; // the board keeps its size; the sheet grows inside it
+  if (z === 1) board.style.height = '';
+  SIG.zoom = z;
+  pad.style.width = z * 100 + '%';
+  board.style.overflow = z > 1 ? 'auto' : 'hidden';
+  board.scrollLeft = px * pad.offsetWidth - fx * board.clientWidth; board.scrollTop = py * pad.offsetHeight - fy * board.clientHeight;
+  $('#signZoomVal').textContent = Math.round(z * 100) + '%';
+}
+$('#signZoomIn').addEventListener('click', () => padZoom(SIG.zoom < 2 ? SIG.zoom + 0.5 : SIG.zoom + 1));
+$('#signZoomOut').addEventListener('click', () => padZoom(SIG.zoom <= 2 ? SIG.zoom - 0.5 : SIG.zoom - 1));
+$('#signBoard').addEventListener('wheel', (e) => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  const r = e.currentTarget.getBoundingClientRect();
+  padZoom(SIG.zoom * (e.deltaY < 0 ? 1.2 : 1 / 1.2), (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+}, { passive: false });
+$('#signText').addEventListener('input', (e) => { $('#signPreview').textContent = e.target.value || 'Your Name'; });
+$('#signClear').addEventListener('click', () => { SIG.strokes = []; inkChanged(); });
+/* ---- ink: strokes are rendered the way a pen lays them down, not as uniform lines.
+ * A stroke is a spline through every point the hand produced, so no wave or corner is rounded away. It is
+ * drawn as it grows (only the new part each frame, which keeps touch input responsive), with speed standing
+ * in for pressure when there is no stylus: a slower hand leaves a slightly wider, denser line. */
+function rng(a) {
+  return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+let grainTile = null, inkL = null;
+function inkGrain(ctx) {
+  if (!grainTile) {
+    grainTile = document.createElement('canvas'); grainTile.width = grainTile.height = 256;
+    const g = grainTile.getContext('2d'), im = g.createImageData(256, 256), r = rng(7);
+    for (let i = 0; i < im.data.length; i += 4) { const v = r(); im.data[i + 3] = v * v * v * 255; }
+    g.putImageData(im, 0, 0);
+  }
+  return ctx.createPattern(grainTile, 'repeat');
+}
+// The stroke being worked on is built on its own layer and laid onto the sheet as one piece.
+function inkLayer() {
+  if (!inkL) { const c = document.createElement('canvas'); c.width = PAD_W; c.height = PAD_H; inkL = c.getContext('2d'); }
+  return inkL;
+}
+const inkPen = () => { const marker = SIG.pen === 'marker'; return { marker, base: (marker ? 26 : 7.5) * SIG.size }; };
+const inkWidth = (pen, p) => pen.base * (pen.marker ? 0.92 + 0.1 * p : 0.8 + 0.24 * p);
+function inkReset(st) { st.Q = []; st.S = []; st.len = []; st.cf = []; st.seg = 0; st.np = 0; st.v = 0; st.body = 0; st.thin = 0; }
+// Take in the points added since the last call. A span between two points is final once the point after it is
+// known (or the pen has lifted: `fin`), so everything drawn here never has to be redrawn.
+function inkFeed(st, L, fin) {
+  const P = st.pts, n = P.length, Q = st.Q, pen = inkPen();
+  for (; st.np < n; st.np++) { // pressure
+    const i = st.np;
+    if (i) {
+      const dt = Math.max(1, P[i][3] - P[i - 1][3]);
+      st.v += (Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]) / st.k / dt - st.v) * Math.min(1, dt / 50);
+    }
+    P[i][4] = st.stylus ? clamp(0.25 + P[i][2] * 1.1, 0.1, 1) : clamp(1.05 - st.v / 2.8, 0.15, 1);
+  }
+  // Steadying: the small wobbles a hand makes on glass are averaged out over a short stretch of line (D).
+  // Corners and stroke ends are left exactly where they were drawn, and the stretch shrinks to nothing as it
+  // nears one, so letters keep their shape; only the tremor goes. S holds the steadied points.
+  const S = st.S, len = st.len, cf = st.cf, D = SIG.smooth ? 16 * st.k : 0, C = D * 0.75; // C: arm length for judging a corner, long enough that tremor is not mistaken for one
+  for (let i = len.length; i < n; i++) len.push(i ? len[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]) : 0);
+  const corner = (k) => {
+    if (k <= 0 || k >= n - 1) return true;
+    if (cf[k] !== undefined) return cf[k];
+    let a = k, b = k;
+    while (a > 0 && len[k] - len[a] < C) a--;
+    while (b < n - 1 && len[b] - len[k] < C) b++;
+    const ux = P[k][0] - P[a][0], uy = P[k][1] - P[a][1], vx = P[b][0] - P[k][0], vy = P[b][1] - P[k][1];
+    return (cf[k] = ux * vx + uy * vy < 0.35 * Math.hypot(ux, uy) * Math.hypot(vx, vy)); // turns sharper than ~70°
+  };
+  while (S.length < n) {
+    const i = S.length;
+    if (!fin && (i === n - 1 || len[n - 1] - len[i] < D + C)) break; // not enough line ahead yet to judge this point
+    let R = D;
+    if (D && corner(i)) R = 0;
+    for (let a = i - 1; R && a >= 0 && len[i] - len[a] <= R; a--) if (corner(a)) R = len[i] - len[a];
+    for (let b = i + 1; R && b < n && len[b] - len[i] <= R; b++) if (corner(b)) R = len[b] - len[i];
+    let sw = 0, sx = 0, sy = 0;
+    for (let j = i; j >= 0 && len[i] - len[j] <= R; j--) { const w = Math.exp(-2 * ((len[i] - len[j]) / (R || 1)) ** 2); sw += w; sx += w * P[j][0]; sy += w * P[j][1]; }
+    for (let j = i + 1; j < n && len[j] - len[i] <= R; j++) { const w = Math.exp(-2 * ((len[j] - len[i]) / (R || 1)) ** 2); sw += w; sx += w * P[j][0]; sy += w * P[j][1]; }
+    S.push([sx / sw, sy / sw, 0, 0, P[i][4]]);
+  }
+  const ns = S.length;
+  if (!Q.length && ns) Q.push({ x: S[0][0], y: S[0][1], p: S[0][4] });
+  for (const last = fin ? ns - 1 : ns - 2; st.seg < last; st.seg++) { // Catmull-Rom span S[i] → S[i+1]
+    const i = st.seg, a = S[Math.max(0, i - 1)], b = S[i], c = S[i + 1], d = S[Math.min(ns - 1, i + 2)];
+    const steps = Math.max(1, Math.ceil(Math.hypot(c[0] - b[0], c[1] - b[1]) / 2));
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps, t2 = t * t, t3 = t2 * t;
+      const cr = (j) => 0.5 * (2 * b[j] + (c[j] - a[j]) * t + (2 * a[j] - 5 * b[j] + 4 * c[j] - d[j]) * t2 + (3 * b[j] - a[j] - 3 * c[j] + d[j]) * t3);
+      Q.push({ x: cr(0), y: cr(1), p: b[4] + (c[4] - b[4]) * t });
+    }
+  }
+  const dab = (q, rad) => { L.beginPath(); L.arc(q.x, q.y, rad, 0, 7); L.fill(); };
+  L.save();
+  L.lineCap = L.lineJoin = 'round'; L.strokeStyle = L.fillStyle = SIG.color;
+  if (pen.marker) { L.shadowColor = SIG.color; L.shadowBlur = pen.base * 0.06; } // felt tips bleed slightly into the paper
+  for (; st.body < Q.length; st.body++) { // the body of the line, width following pressure
+    const i = st.body, q = Q[i], w = inkWidth(pen, q.p);
+    if (!i) { dab(q, w * (pen.marker ? 0.5 : 0.56)); continue; } // where the tip first rests it leaves a little extra
+    L.lineWidth = (inkWidth(pen, Q[i - 1].p) + w) / 2;
+    L.beginPath(); L.moveTo(Q[i - 1].x, Q[i - 1].y); L.lineTo(q.x, q.y); L.stroke();
+  }
+  if (!pen.marker) { // ballpoint: a quicker hand leaves a little less ink, and the paper's tooth shows through it
+    L.shadowBlur = 0; L.globalCompositeOperation = 'destination-out';
+    const grain = inkGrain(L);
+    for (const upto = fin ? Q.length : Q.length - 10; st.thin < upto; st.thin++) { // kept behind the body so later ink cannot cover it
+      const i = st.thin, q = Q[i], w = inkWidth(pen, q.p), lite = 0.02 + 0.16 * Math.pow(1 - q.p, 1.5);
+      L.globalAlpha = 1; L.fillStyle = `rgba(0,0,0,${1 - Math.pow(1 - lite, 1 / Math.max(2, w * 0.75))})`; dab(q, w * 0.75);
+      if (i % 2 === 0) { L.fillStyle = grain; L.globalAlpha = 0.06 + 0.16 * (1 - q.p); dab(q, w * 0.8); }
+    }
+  }
+  L.restore();
+}
+// Touches that need the whole stroke: done once, when the pen lifts.
+function inkFinish(st, L) {
+  const Q = st.Q, m = Q.length, pen = inkPen(), r = rng(st.seed);
+  const trace = (off, when) => { // one path along the stroke, shifted sideways by `off`
+    L.beginPath();
+    let on = false;
+    for (let i = 0; i < m; i++) {
+      if (when && !when(Q[i])) { on = false; continue; }
+      const a = Q[Math.max(0, i - 1)], b = Q[Math.min(m - 1, i + 1)], l = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const x = Q[i].x - ((b.y - a.y) / l) * off, y = Q[i].y + ((b.x - a.x) / l) * off;
+      if (on) L.lineTo(x, y); else L.moveTo(x, y);
+      on = true;
+    }
+    L.stroke();
+  };
+  L.save();
+  L.lineCap = L.lineJoin = 'round';
+  L.globalCompositeOperation = 'destination-out';
+  if (!pen.marker) { L.strokeStyle = 'rgba(0,0,0,.1)'; L.lineWidth = pen.base * 0.16; trace(pen.base * 0.13); } // the groove the ball rolls in
+  else {
+    L.strokeStyle = 'rgba(0,0,0,.06)'; L.lineWidth = pen.base * 0.6; trace(0); // ink gathers at the edges of the line
+    for (let k = 0; k < 3; k++) { // a quick stroke drags the odd dry streak
+      const off = (r() - 0.5) * pen.base * 0.8, thr = 0.2 + 0.15 * r();
+      L.strokeStyle = `rgba(0,0,0,${0.06 + 0.12 * r()})`; L.lineWidth = pen.base * (0.03 + 0.03 * r());
+      trace(off, (q) => q.p < thr);
+    }
+    L.fillStyle = inkGrain(L); L.globalAlpha = 0.1; L.fillRect(0, 0, PAD_W, PAD_H);
+  }
+  L.restore();
+}
+function inkStroke(L, st) { L.clearRect(0, 0, PAD_W, PAD_H); inkReset(st); inkFeed(st, L, true); inkFinish(st, L); }
+// Lay a finished (or growing) stroke on the sheet; crossings come out darker, as they do with real ink.
+function inkStamp(ctx, L) { ctx.save(); ctx.globalAlpha = SIG.pen === 'marker' ? 0.9 : 0.96; ctx.drawImage(L.canvas, 0, 0); ctx.restore(); }
+function renderSig(ctx) { const L = inkLayer(); for (const st of SIG.strokes) { inkStroke(L, st); inkStamp(ctx, L); } }
+function inkChanged() { SIG.cached = -1; drawPad(); }
+// Finished strokes are cached; while the pen is down only the new part of its stroke is drawn.
+function drawPad() {
+  const ctx = $('#signPad').getContext('2d'), L = inkLayer();
+  if (!SIG.cache) { SIG.cache = document.createElement('canvas'); SIG.cache.width = PAD_W; SIG.cache.height = PAD_H; }
+  const done = SIG.strokes.length - (SIG.live ? 1 : 0), c = SIG.cache.getContext('2d');
+  if (SIG.cached < 0 || SIG.cached > done) { c.clearRect(0, 0, PAD_W, PAD_H); SIG.cached = 0; }
+  for (; SIG.cached < done; SIG.cached++) { inkStroke(L, SIG.strokes[SIG.cached]); inkStamp(c, L); }
+  ctx.clearRect(0, 0, PAD_W, PAD_H);
+  ctx.strokeStyle = '#d8d8d8'; ctx.lineWidth = 2; ctx.setLineDash([10, 10]); ctx.beginPath(); ctx.moveTo(90, PAD_H * 0.75); ctx.lineTo(PAD_W - 90, PAD_H * 0.75); ctx.stroke(); ctx.setLineDash([]);
+  ctx.drawImage(SIG.cache, 0, 0);
+  if (!SIG.live) return;
+  const st = SIG.strokes[SIG.strokes.length - 1], pen = inkPen();
+  inkFeed(st, L, false);
+  inkStamp(ctx, L);
+  const a = st.Q[st.Q.length - 1], P = st.pts; // the newest stretch is not settled yet: show it as drawn
+  ctx.save(); ctx.globalAlpha = 0.9; ctx.strokeStyle = SIG.color; ctx.lineCap = ctx.lineJoin = 'round'; ctx.lineWidth = inkWidth(pen, P[P.length - 1][4] ?? 0.6);
+  ctx.beginPath();
+  if (a) ctx.moveTo(a.x, a.y); else ctx.moveTo(P[0][0], P[0][1]);
+  for (let j = a ? st.seg + 1 : 0; j < P.length; j++) ctx.lineTo(P[j][0], P[j][1]);
+  ctx.stroke(); ctx.restore();
+}
+(() => {
+  const pad = $('#signPad'), board = $('#signBoard');
+  const down = new Map(); // every finger or pen currently on the board
+  let cur = null, raf = 0, pan = null;
+  const pt = (e) => { const r = pad.getBoundingClientRect(); return [((e.clientX - r.left) / r.width) * PAD_W, ((e.clientY - r.top) / r.height) * PAD_H, e.pressure || 0.5, e.timeStamp]; };
+  const redraw = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; drawPad(); }); };
+  const two = () => { const [a, b] = [...down.values()]; return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1 }; };
+  pad.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+  pad.addEventListener('pointerdown', (e) => {
+    if (e.button > 0) return;
+    e.preventDefault();
+    down.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try { pad.setPointerCapture(e.pointerId); } catch {}
+    if (cur) {
+      // Two fingers landing together move or pinch-zoom the board. A touch that arrives later is a resting palm
+      // and is ignored: only one pen writes at a time.
+      if (e.pointerType === 'touch' && down.size === 2 && e.timeStamp - cur.t0 < 300 && cur.pts.length < 12) {
+        SIG.strokes.pop(); SIG.live = false; cur = null;
+        pan = { ...two(), z: SIG.zoom };
+        drawPad();
+      }
+      return;
+    }
+    if (pan) return;
+    drawPad(); // settle earlier strokes before the layer is reused
+    cur = { pts: [pt(e)], seed: (Math.random() * 1e9) | 0, stylus: e.pointerType === 'pen', id: e.pointerId, t0: e.timeStamp, k: PAD_W / pad.getBoundingClientRect().width };
+    inkLayer().clearRect(0, 0, PAD_W, PAD_H); inkReset(cur);
+    SIG.strokes.push(cur); SIG.live = true;
+    redraw();
+  });
+  pad.addEventListener('pointermove', (e) => {
+    const f = down.get(e.pointerId);
+    if (f) { f.x = e.clientX; f.y = e.clientY; }
+    if (pan && down.size >= 2) {
+      const t = two(), r = board.getBoundingClientRect();
+      board.scrollLeft -= t.x - pan.x; board.scrollTop -= t.y - pan.y;
+      pan.x = t.x; pan.y = t.y;
+      if (Math.abs(t.d / pan.d - 1) > 0.06) padZoom(pan.z * (t.d / pan.d), (t.x - r.left) / r.width, (t.y - r.top) / r.height);
+      return;
+    }
+    if (!cur || e.pointerId !== cur.id) return;
+    const evs = e.getCoalescedEvents?.() || [];
+    for (const c of evs.length ? evs : [e]) {
+      const p = pt(c), l = cur.pts[cur.pts.length - 1];
+      if (Math.hypot(p[0] - l[0], p[1] - l[1]) >= 1.6 * cur.k) cur.pts.push(p); // same spacing as the Draw tool
+    }
+    redraw();
+  });
+  const end = (e) => {
+    down.delete(e.pointerId);
+    if (pan) { if (down.size < 2) pan = null; return; }
+    if (!cur || e.pointerId !== cur.id) return;
+    const p = pt(e), l = cur.pts[cur.pts.length - 1];
+    if (e.type === 'pointerup' && Math.hypot(p[0] - l[0], p[1] - l[1]) >= 0.5 * cur.k) cur.pts.push(p);
+    const L = inkLayer();
+    inkFeed(cur, L, true); inkFinish(cur, L);
+    inkStamp(SIG.cache.getContext('2d'), L);
+    SIG.cached = SIG.strokes.length;
+    cur = null; SIG.live = false;
+    drawPad();
+  };
+  pad.addEventListener('pointerup', end);
+  pad.addEventListener('pointercancel', end);
+})();
 function trimCanvas(c) {
   const ctx = c.getContext('2d');
   const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height);
@@ -1808,8 +2375,8 @@ $('#signPlace').addEventListener('click', async () => {
   let url = null, c;
   if (SIG.tab === 'saved') url = SIG.saved[SIG.pick];
   else if (SIG.tab === 'draw') {
-    c = document.createElement('canvas'); c.width = 1200; c.height = 400;
-    drawPad(c.getContext('2d'), 1200, 400, false);
+    c = document.createElement('canvas'); c.width = PAD_W; c.height = PAD_H;
+    renderSig(c.getContext('2d'));
     c = trimCanvas(c);
   } else {
     const t = $('#signText').value.trim();
@@ -1826,11 +2393,17 @@ $('#signPlace').addEventListener('click', async () => {
   if (SIG.tab !== 'saved' && $('#signRemember').checked && !SIG.saved.includes(url)) { SIG.saved.unshift(url); storeSaved(); }
   const img = await new Promise((r) => { const i = new Image(); i.onload = () => r(i); i.src = url; });
   $('#signModal').hidden = true;
-  SIG.strokes = []; drawPad();
+  const drawn = SIG.tab === 'draw';
+  SIG.strokes = []; inkChanged();
+  if (drawn) { // keep the pen's real line weight: the whole pad is about 230pt of paper
+    const w = Math.max(24, (img.width / PAD_W) * 230);
+    placeImage(url, w, (w * img.height) / img.width, 0.6, { ink: true });
+    return;
+  }
   const pg = currentPage();
   const [W] = dispSize(pg);
   const targetW = Math.min(W * 0.3, 180);
-  placeImage(url, targetW * 4, (targetW * 4 * img.height) / img.width, 0.3);
+  placeImage(url, targetW * 4, (targetW * 4 * img.height) / img.width, 0.3, { ink: true });
 });
 
 /* ================================================================ PAGES & THUMBNAILS */
@@ -2223,7 +2796,7 @@ async function drawObj(doc, page, pg, o, cache, stats) {
       return data.startsWith('data:image/jpeg') ? doc.embedJpg(bytes) : doc.embedPng(bytes);
     });
     const p = map(o.x, o.y + o.h);
-    page.drawImage(img, { x: p.x, y: p.y, width: o.w, height: o.h, rotate: rot, opacity: op });
+    page.drawImage(img, { x: p.x, y: p.y, width: o.w, height: o.h, rotate: rot, opacity: op, ...(o.ink ? { blendMode: BlendMode.Multiply } : {}) });
   }
 }
 async function save(saveAs = false) {
@@ -2234,7 +2807,8 @@ async function save(saveAs = false) {
   const label = btn.querySelector('span').textContent;
   btn.querySelector('span').textContent = 'Saving…';
   try {
-    const { bytes, stats } = await exportPdf();
+    let { bytes, stats } = await exportPdf();
+    if (S.fx.bw || S.fx.scan) bytes = await filterPdf(bytes, S.fx, (i, n) => toast(`Applying filter: page ${i} of ${n}…`, 60000));
     const base = S.fileName.replace(/\.pdf$/i, '');
     const suggested = S.fileHandle && !saveAs ? S.fileName : `${base}${/-edited$/.test(base) ? '' : '-edited'}.pdf`;
     let savedName = null;
@@ -2271,6 +2845,100 @@ async function save(saveAs = false) {
 }
 $('#btnSave').onclick = () => save(false);
 $('#btnSaveAs').onclick = () => save(true);
+
+/* ================================================================ PAGE FILTERS
+ * Black & white and Scanned are independent switches. A filtered document is saved the way a scanner would
+ * deliver it: every page becomes an image. The editor view only approximates the look with CSS so the page
+ * stays editable; the saved file carries the real one. */
+function setFx(name, on, quiet = false) {
+  S.fx[name] = on;
+  document.body.toggleAttribute('data-' + name, on);
+  $(name === 'bw' ? '#fxBw' : '#fxScan').classList.toggle('on', on);
+  if (quiet) return;
+  setDirty(true);
+  if (on) toast('Applied when you save. Filtered pages are saved as images, so their text is no longer selectable.', 4500);
+}
+$('#fxBw').onclick = () => setFx('bw', !S.fx.bw);
+$('#fxScan').onclick = () => setFx('scan', !S.fx.scan);
+function grayLook(c) {
+  const ctx = c.getContext('2d'), im = ctx.getImageData(0, 0, c.width, c.height), d = im.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const v = clamp((0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] - 128) * 1.08 + 128, 0, 255);
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(im, 0, 0);
+  return c;
+}
+// What a print-and-scan round trip does to a page, and no more: a good scan is clean and evenly lit. The sheet
+// lies a fraction of a degree off square, toner spreads so strokes soften and thicken, black comes back as
+// a slightly faded dark grey that is never perfectly even, paper as clean white (scanner apps whiten it), with
+// fine sensor noise over it all.
+// In `mono` (black & white scan) every ink, whatever its colour or how lightly it was laid, comes back as the
+// same black, and anything fainter than ink (tints, pale stamps) drops out to white, as a scanner's text mode does.
+function scanLook(src, seed, mono) {
+  const w = src.width, h = src.height, r = rng(seed * 7919 + 13), u = w / 1700;
+  const o = document.createElement('canvas'); o.width = w; o.height = h;
+  const ctx = o.getContext('2d', { willReadFrequently: true });
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  ctx.save();
+  ctx.translate(w / 2 + (r() - 0.5) * w * 0.005, h / 2 + (r() - 0.5) * h * 0.004);
+  ctx.rotate((r() - 0.5) * 0.012);
+  ctx.filter = `blur(${(0.6 * u).toFixed(2)}px)`;
+  ctx.drawImage(src, -w / 2, -h / 2);
+  ctx.restore();
+  const im = ctx.getImageData(0, 0, w, h), d = im.data;
+  const gw = 9, gh = 12, grid = new Float32Array((gw + 1) * (gh + 1)).map(() => 0.91 + (r() - 0.5) * 0.18); // toner fades in patches
+  const lut = new Float32Array(256); // how much ink a scanned value amounts to (0 = paper, 1 = solid)
+  for (let v = 0; v < 256; v++) {
+    if (mono) { const t = clamp((v - 105) / 100, 0, 1); lut[v] = 1 - t * t * (3 - 2 * t); }
+    else lut[v] = 1 - Math.pow(clamp((v - 22) / 213, 0, 1), 1.18);
+    lut[v] = clamp((lut[v] - 0.07) / 0.93, 0, 1); // auto-whitening: the faintest tones wash out to paper
+  }
+  const paper = mono ? [254, 254, 254] : [254, 254, 251], black = mono ? 42 : 44; // print comes back a little faded
+  const tilt = (r() - 0.5) * 0.02;
+  for (let y = 0, i = 0; y < h; y++) {
+    const fy = (y / h) * gh, y0 = Math.min(gh - 1, fy | 0), ty = fy - y0;
+    for (let x = 0; x < w; x++, i += 4) {
+      const fx = (x / w) * gw, x0 = Math.min(gw - 1, fx | 0), tx = fx - x0, g = y0 * (gw + 1) + x0;
+      const den = (grid[g] * (1 - tx) + grid[g + 1] * tx) * (1 - ty) + (grid[g + gw + 1] * (1 - tx) + grid[g + gw + 2] * tx) * ty;
+      const light = 1 - tilt * (x / w - 0.5), n = r() - 0.5;
+      const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      for (let k = 0; k < 3; k++) {
+        const a = lut[mono ? Math.round(l) : Math.round(l + (d[i + k] - l) * 0.86)], ink = Math.min(1, a * den * (1 - 0.3 * Math.abs(n)));
+        d[i + k] = clamp((paper[k] - (paper[k] - black) * ink) * light + n * (1.5 + 7 * a), 0, 255);
+      }
+    }
+  }
+  ctx.putImageData(im, 0, 0);
+  for (let k = Math.round(3 + r() * 5); k > 0; k--) { // a few specks of dust on the glass
+    ctx.fillStyle = `rgba(40,40,40,${0.2 + 0.3 * r()})`;
+    ctx.beginPath(); ctx.arc(r() * w, r() * h, (0.4 + r() * r()) * u, 0, 7); ctx.fill();
+  }
+  return o;
+}
+async function filterPdf(bytes, fx, progress) {
+  const src = await pdfjsLib.getDocument({ ...PDFJS_OPTS, data: bytes.slice() }).promise;
+  const out = await PDFDocument.create();
+  try {
+    for (let i = 1; i <= src.numPages; i++) {
+      progress?.(i, src.numPages);
+      const page = await src.getPage(i);
+      const v1 = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: Math.min(200 / 72, Math.sqrt(12e6 / (v1.width * v1.height))) }); // 200 dpi
+      const c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      const done = fx.scan ? scanLook(c, i, fx.bw) : grayLook(c);
+      const blob = await new Promise((res) => done.toBlob(res, 'image/jpeg', fx.scan ? 0.82 : 0.9));
+      const img = await out.embedJpg(await blob.arrayBuffer());
+      out.addPage([v1.width, v1.height]).drawImage(img, { x: 0, y: 0, width: v1.width, height: v1.height });
+      page.cleanup(); c.width = done.width = 0;
+    }
+  } finally { src.destroy(); }
+  out.setProducer('Folio PDF Editor');
+  return out.save();
+}
 
 /* ================================================================ FILE ENTRY POINTS */
 async function pickOpen() {
@@ -2357,7 +3025,7 @@ $('#btnSample').onclick = async () => {
 
 /* ================================================================ KEYBOARD */
 function isTyping(t) { return t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)); }
-const TOOL_KEYS = { v: 'select', e: 'edit', t: 'text', w: 'whiteout', h: 'highlight', r: 'rect', o: 'ellipse', l: 'line', a: 'arrow', d: 'draw', i: 'image', s: 'sign' };
+const TOOL_KEYS = { v: 'select', e: 'edit', t: 'text', x: 'cut', w: 'whiteout', h: 'highlight', r: 'rect', o: 'ellipse', l: 'line', a: 'arrow', d: 'draw', i: 'image', s: 'sign' };
 document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
   const k = e.key.toLowerCase();

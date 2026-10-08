@@ -77,6 +77,8 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
   padding: 0 6px; width: 96px; font-variant-numeric: tabular-nums;
 }
 
+.tb.on { background: var(--accent-soft); color: var(--accent); }
+
 /* ---------- layout ---------- */
 .main { display: grid; grid-template-columns: 48px 172px 1fr 252px; min-height: 0; }
 .rail {
@@ -156,7 +158,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .pages.t-select .page, .pages.t-edit .page { cursor: default; }
 .pages.t-text .page { cursor: text; }
 .pages.t-whiteout .page, .pages.t-highlight .page, .pages.t-rect .page, .pages.t-ellipse .page,
-.pages.t-line .page, .pages.t-arrow .page, .pages.t-draw .page { cursor: crosshair; }
+.pages.t-line .page, .pages.t-arrow .page, .pages.t-draw .page, .pages.t-cut .page { cursor: crosshair; }
 
 /* existing text hit regions in Edit mode */
 .hit { position: absolute; cursor: text; border-radius: 1px; }
@@ -175,6 +177,13 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .obj.text:empty::before { content: "\200b"; }
 .obj.box, .obj.ellipse { box-sizing: border-box; }
 .obj.highlight { mix-blend-mode: multiply; }
+.obj.image.ink { mix-blend-mode: multiply; }
+/* filter preview (the saved file carries the real effect) */
+body[data-bw] .page > canvas, body[data-bw] .page .layer, body[data-bw] .thumb canvas { filter: grayscale(1) contrast(1.08); }
+body[data-scan] .page > canvas, body[data-scan] .page .layer, body[data-scan] .thumb canvas { filter: saturate(.86) contrast(1.06) blur(.25px); }
+body[data-scan][data-bw] .page > canvas, body[data-scan][data-bw] .page .layer, body[data-scan][data-bw] .thumb canvas { filter: grayscale(1) contrast(2.1) brightness(1.06) blur(.25px); }
+body[data-scan] .page::before { content: ""; position: absolute; inset: 0; z-index: 4; pointer-events: none; mix-blend-mode: multiply; background: #fcfbf7; }
+body[data-scan][data-bw] .page::before { background: #fafafa; }
 .obj.image img { width: 100%; height: 100%; display: block; pointer-events: none; }
 svg.vec { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 svg.vec .hitpath { pointer-events: stroke; stroke: transparent; cursor: move; }
@@ -190,6 +199,7 @@ svg.vec .hitpath { pointer-events: stroke; stroke: transparent; cursor: move; }
 .handle[data-h="p1"], .handle[data-h="p2"] { cursor: move; border-radius: 50%; }
 .handle[data-h="fs"] { cursor: nwse-resize; border-radius: 50%; background: var(--accent); }
 .drag-rect { position: absolute; border: 1px dashed var(--accent); background: var(--accent-soft); pointer-events: none; }
+.cut-band { position: absolute; left: 0; right: 0; background: rgba(217, 48, 37, .16); box-shadow: inset 0 1px 0 var(--danger), inset 0 -1px 0 var(--danger); pointer-events: none; }
 .flash { position: absolute; background: rgba(255, 200, 0, .45); outline: 2px solid #f59f00; border-radius: 2px; pointer-events: none; mix-blend-mode: multiply; }
 .flash.dim { background: rgba(255, 200, 0, .22); outline: 0; }
 
@@ -281,9 +291,16 @@ svg.vec .hitpath { pointer-events: stroke; stroke: transparent; cursor: move; }
 .dialog-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .ask-dialog { width: min(440px, 100%); }
 .ask-dialog p { margin: 0; color: var(--ink-2); }
-#signPad { width: 100%; aspect-ratio: 3 / 1; background: #fff; border: 1px dashed var(--line-strong); border-radius: 8px; touch-action: none; cursor: crosshair; display: block; }
-.sign-tools { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
-.swatches { display: flex; gap: 8px; }
+.sign-board { overflow: hidden; background: #fff; outline: 1px dashed var(--line-strong); border-radius: 8px; }
+#signPad { width: 100%; aspect-ratio: 3 / 1; touch-action: none; cursor: crosshair; display: block; }
+.sign-zoom { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.sign-zoom .btn { min-width: 28px; padding: 0 8px; }
+.sign-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-top: 10px; }
+.sign-tools .spacer { flex: 1; }
+.sign-size { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.sign-size input { width: 84px; accent-color: var(--accent); }
+#signColor { width: 24px; height: 24px; padding: 0; border: 0; background: none; cursor: pointer; }
+.swatches { display: flex; align-items: center; gap: 8px; }
 .swatches button { width: 22px; height: 22px; border-radius: 50%; border: 2px solid transparent; background: var(--c); box-shadow: 0 0 0 1px var(--line-strong); }
 .swatches button.on { border-color: var(--panel); box-shadow: 0 0 0 2px var(--accent); }
 #signText { width: 100%; height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); padding: 0 10px; }
