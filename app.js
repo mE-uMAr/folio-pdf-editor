@@ -48,7 +48,7 @@ const STD_FONTS = {
 };
 
 const S = {
-  sources: [], pages: [], zoom: 1, zoomMode: 'fitw', tool: 'select', sel: null, multi: [], editing: null,
+  sources: [], pages: [], zoom: 1, zoomMode: 'fitw', tool: 'select', sel: null, multi: [], shapes: null, editing: null,
   fileName: 'document.pdf', fileHandle: null, images: {}, dirty: false, clip: null, fx: { bw: false, scan: false },
   defaults: {
     text: { font: 'Helvetica', size: 14, bold: false, italic: false, underline: false, color: '#111111', align: 'left', opacity: 1 },
@@ -64,7 +64,7 @@ const S = {
 };
 // runtime caches (never part of undo history)
 const RT = {
-  models: new Map(), libDocs: new Map(), fonts: new Map(), customFonts: new Map(), geoms: new Map(),
+  models: new Map(), libDocs: new Map(), fonts: new Map(), customFonts: new Map(), geoms: new Map(), shapes: new Map(),
   previews: new Map(), imgUrls: new Map(), baselines: new Map(), observer: null, thumbObserver: null,
 };
 
@@ -128,6 +128,7 @@ function restore(s) {
   S.pages = JSON.parse(s);
   if (S.sel && !findObj(S.sel)) S.sel = null;
   S.multi = S.multi.filter((id) => findObj(id));
+  S.shapes = null; showShapeSel();
   if (structKey() !== before) buildViewer();
   else S.pages.forEach((pg) => { renderLayer(pg); refreshCanvas(pg); if (hitsOn()) renderHits(pg); });
   renderProps(); setDirty(true);
@@ -139,6 +140,7 @@ function setDirty(v) { S.dirty = v; $('#dirtyDot').hidden = !v; }
 
 /* ================================================================ LOADING */
 async function loadSource(bytes, name) {
+  try { bytes = await inlineForms(bytes); } catch (e) { console.warn('form inlining skipped:', e); }
   const doc = await pdfjsLib.getDocument({ ...PDFJS_OPTS, data: bytes.slice() }).promise;
   const src = S.sources.length;
   S.sources.push({ bytes, doc, name });
@@ -155,8 +157,8 @@ async function openBytes(bytes, name, handle = null) {
     endEdit();
     for (const s of S.sources) s.doc.destroy();
     for (const p of RT.previews.values()) p.doc?.destroy?.();
-    Object.assign(RT, { models: new Map(), libDocs: new Map(), fonts: new Map(), previews: new Map(), geoms: new Map() });
-    S.sources = []; S.images = {}; S.sel = null; S.multi = [];
+    Object.assign(RT, { models: new Map(), libDocs: new Map(), fonts: new Map(), previews: new Map(), geoms: new Map(), shapes: new Map() });
+    S.sources = []; S.images = {}; S.sel = null; S.multi = []; S.shapes = null;
     setFx('bw', false, true); setFx('scan', false, true);
     S.pages = await loadSource(bytes, name);
     S.fileName = name; S.fileHandle = handle;
@@ -737,6 +739,67 @@ function wrapContents(doc, page) {
   page.node.set(PDFName.of('Contents'), ctx.obj([q, ...arr, Q]));
 }
 
+/* ================================================================ FORM INLINING
+ * Many PDFs (re-saved by online editors, Canva, some printers) draw a whole page as one form XObject.
+ * Text and shapes inside a form can't be edited at page level, so on load every form a page draws is
+ * spliced into the page's own content (its matrix and clip kept, its resources merged). */
+const RES_KINDS = ['Font', 'XObject', 'ExtGState', 'ColorSpace', 'Pattern', 'Shading', 'Properties'];
+const latin1 = (str) => Uint8Array.from(str, (c) => c.charCodeAt(0) & 255);
+async function inlineForms(bytes) {
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+  let changed = false;
+  for (const page of doc.getPages()) for (let pass = 0; pass < 4 && inlinePass(doc, page); pass++) changed = true;
+  return changed ? await doc.save({ useObjectStreams: false }) : bytes;
+}
+function inlinePass(doc, page) {
+  const ctx = doc.context, N = (n) => PDFName.of(n);
+  const res = page.node.Resources();
+  const xo = res?.lookup(N('XObject'));
+  if (!(xo instanceof PDFLib.PDFDict)) return false;
+  const b = contentBytes(page);
+  const edits = [];
+  for (const o of parseOps(b)) {
+    if (o.op !== 'Do') continue;
+    const name = o.args[o.args.length - 1]?.v;
+    const st = typeof name === 'string' && xo.lookup(N(name));
+    if (!(st instanceof PDFLib.PDFStream) || st.dict.get(N('Subtype')) !== N('Form')) continue;
+    let body = new TextDecoder('latin1').decode(st instanceof PDFLib.PDFRawStream ? PDFLib.decodePDFRawStream(st).decode() : st.getContents());
+    const fres = st.dict.lookup(N('Resources'));
+    if (fres instanceof PDFLib.PDFDict) {
+      for (const kind of RES_KINDS) {
+        const from = fres.lookup(N(kind));
+        if (!(from instanceof PDFLib.PDFDict)) continue;
+        let into = res.lookup(N(kind));
+        if (!(into instanceof PDFLib.PDFDict)) { into = ctx.obj({}); res.set(N(kind), into); }
+        for (const [k, v] of from.entries()) {
+          const cur = into.get(k);
+          if (!cur) { into.set(k, v); continue; }
+          if (cur === v || cur.toString() === v.toString()) continue;
+          const old = k.decodeText();
+          let nn, i = 1;
+          do nn = `${old}_f${i++}`; while (into.get(N(nn)));
+          into.set(N(nn), v);
+          body = body.replace(new RegExp('/' + escapeRe(old) + '(?=[\\s/\\[\\]<>(){}%]|$)', 'g'), '/' + nn);
+        }
+      }
+    }
+    const m = st.dict.lookup(N('Matrix'))?.asArray?.().map((x) => x.asNumber()) || I;
+    const bb = st.dict.lookup(N('BBox'))?.asArray?.().map((x) => x.asNumber());
+    const clip = bb ? `${fnum(bb[0])} ${fnum(bb[1])} ${fnum(bb[2] - bb[0])} ${fnum(bb[3] - bb[1])} re W n` : '';
+    edits.push({ s: o.start, e: o.end, text: `\nq ${m.map(fnum).join(' ')} cm ${clip}\n${body}\nQ\n` });
+  }
+  if (!edits.length) return false;
+  const chunks = [];
+  let last = 0;
+  for (const e of edits) { chunks.push(b.subarray(last, e.s), latin1(e.text)); last = e.e; }
+  chunks.push(b.subarray(last));
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let q = 0;
+  for (const c of chunks) { out.set(c, q); q += c.length; }
+  page.node.set(N('Contents'), ctx.register(ctx.flateStream(out)));
+  return true;
+}
+
 /* ================================================================ STRIP REMOVAL (table rows)
  * Deleting a row is structural: everything inside a horizontal strip is taken out of the content stream
  * (text, cell borders, images) and what lies below moves up to close the gap. The result becomes the
@@ -795,25 +858,31 @@ function parseOps(b) {
 // Painted paths, text-show operators, XObjects and inline images in stream order, each with its CTM.
 function walkContent(b) {
   const items = [], stack = [];
-  let ctm = I, path = null, k = 0;
+  let ctm = I, cbox = null, path = null, k = 0;
   for (const o of parseOps(b)) {
     switch (o.op) {
-      case 'q': stack.push(ctm); break;
-      case 'Q': if (stack.length) ctm = stack.pop(); break;
+      case 'q': stack.push([ctm, cbox]); break;
+      case 'Q': if (stack.length) [ctm, cbox] = stack.pop(); break;
       case 'cm': { const m = o.args.slice(-6).map((a) => a.v); if (m.length === 6 && m.every(Number.isFinite)) ctm = mul(ctm, m); break; }
       case 'BT': case 'Tm': items.push({ kind: 'reset' }); break;
       case 'Tj': case 'TJ': case "'": case '"': items.push({ kind: 'show', o, k: k++ }); break;
-      case 'Do': case 'BI': items.push({ kind: 'xobj', o, ctm, name: o.op === 'Do' ? o.args[o.args.length - 1]?.v : null }); break;
+      case 'Do': case 'BI': items.push({ kind: 'xobj', o, ctm, cbox, name: o.op === 'Do' ? o.args[o.args.length - 1]?.v : null }); break;
       case 'W': case 'W*': if (path) path.clip = true; break;
       default:
         if (o.op in PATH_ARGS) {
           if (!path) path = { kind: 'path', ctm, segs: [], clip: false, start: o.start };
           path.segs.push(o);
-        } else if (PAINT_OPS.has(o.op) && path) { path.end = o.end; path.paint = o.op; items.push(path); path = null; }
+        } else if (PAINT_OPS.has(o.op) && path) {
+          path.end = o.end; path.paint = o.op; path.cbox = cbox; items.push(path);
+          if (path.clip) cbox = boxAnd(cbox, ptsBox(path.segs.flatMap(segPts).map(([x, y]) => apply(path.ctm, x, y))));
+          path = null;
+        }
     }
   }
   return items;
 }
+const ptsBox = (pts) => (pts.length ? [Math.min(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[1]))] : null);
+const boxAnd = (a, b) => (!a ? b : !b ? a : [Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.min(a[3], b[3])]);
 function segPts(o) {
   const need = PATH_ARGS[o.op];
   const v = o.args.slice(-need).map((a) => a.v);
@@ -942,6 +1011,111 @@ function detectBand(g, p) {
   const t = g.texts.find((r) => has(r) && p.y >= r.y && p.y <= r.y + r.h) || g.texts.find((r) => p.y >= r.y && p.y <= r.y + r.h);
   return t ? { a: t.y - 1, b: t.y + t.h + 1 } : null;
 }
+/* ---- original shapes (paths, images) of a page: selectable and deletable ---- */
+const shapeItem = (it) => it.kind === 'xobj' || (it.kind === 'path' && !it.clip && it.paint !== 'n');
+async function getShapes(pg) {
+  if (pg.blank) return [];
+  const key = `${pg.src}:${pg.index}:${R(pg)}`;
+  if (!RT.shapes.has(key)) RT.shapes.set(key, (async () => {
+    const vp = viewportFor(pg, 1);
+    const page = (await getLibDoc(pg.src)).getPage(pg.index);
+    const out = [];
+    let n = 0;
+    for (const it of walkContent(contentBytes(page))) {
+      if (!shapeItem(it)) continue;
+      const idx = n++;
+      let box;
+      if (it.kind === 'path') box = ptsBox(it.segs.flatMap(segPts).map(([x, y]) => apply(it.ctm, x, y)));
+      else { const { box: bb, m } = xobjBox(page, it.name); const M = mul(it.ctm, m); box = ptsBox([[bb[0], bb[1]], [bb[2], bb[1]], [bb[2], bb[3]], [bb[0], bb[3]]].map(([x, y]) => apply(M, x, y))); }
+      box = boxAnd(box, it.cbox);
+      if (!box || box[2] < box[0] || box[3] < box[1]) continue;
+      const d = ptsBox([[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]].map(([x, y]) => apply(vp, x, y)));
+      out.push({ n: idx, x: d[0], y: d[1], w: d[2] - d[0], h: d[3] - d[1] });
+    }
+    return out;
+  })().catch((e) => { console.warn(e); return []; }));
+  return RT.shapes.get(key);
+}
+// the smallest shape under a point (thin rules get a little slack); page-sized backgrounds are skipped
+async function shapeAt(pg, p) {
+  const [W, H] = dispSize(pg), tol = 2;
+  let best = null;
+  for (const s of await getShapes(pg)) {
+    if (s.w * s.h > W * H * 0.6) continue;
+    if (p.x < s.x - tol || p.x > s.x + s.w + tol || p.y < s.y - tol || p.y > s.y + s.h + tol) continue;
+    if (!best || s.w * s.h < best.w * best.h) best = s;
+  }
+  return best;
+}
+async function showShapeSel() {
+  $$('.shape-sel').forEach((x) => x.remove());
+  const sh = S.shapes, pg = sh && pageById(sh.pg), el = pg && pageEl(pg.id);
+  if (!el) return;
+  const all = await getShapes(pg), z = S.zoom;
+  if (S.shapes !== sh) return;
+  for (const s of all) {
+    if (!sh.ns.includes(s.n)) continue;
+    const d = document.createElement('div');
+    d.className = 'shape-sel';
+    Object.assign(d.style, { left: (s.x - 1) * z + 'px', top: (s.y - 1) * z + 'px', width: (s.w + 2) * z + 'px', height: (s.h + 2) * z + 'px' });
+    el.querySelector('.marks').appendChild(d);
+  }
+}
+function setShapes(pg, ns, add) {
+  if (add && S.shapes?.pg === pg?.id) ns = [...S.shapes.ns.filter((n) => !ns.includes(n)), ...ns.filter((n) => !S.shapes.ns.includes(n))];
+  S.shapes = pg && ns.length ? { pg: pg.id, ns } : null;
+  showShapeSel(); renderProps();
+}
+let hoverEl = null;
+async function hoverShape(e) {
+  const el = e.target.closest('.page');
+  const pg = el && !e.target.closest('.obj, .hit, .handle') && pageById(el.dataset.id);
+  const s = pg && await shapeAt(pg, ptIn(el, e));
+  if (!s || drag || S.tool !== 'select') { hoverEl?.remove(); return; }
+  if (!hoverEl) { hoverEl = document.createElement('div'); hoverEl.className = 'shape-hover'; }
+  el.querySelector('.marks').appendChild(hoverEl);
+  const z = S.zoom;
+  Object.assign(hoverEl.style, { left: (s.x - 1) * z + 'px', top: (s.y - 1) * z + 'px', width: (s.w + 2) * z + 'px', height: (s.h + 2) * z + 'px' });
+}
+// Rebuild a page's source with `edit` applied to its content (pending text edits are baked in first).
+async function rebuildPage(pg, edit) {
+  let at = pg;
+  if (pg.objects.some((o) => o.type === 'tline' && tlineLive(o))) {
+    const { doc, p } = await isolatePage(pg.src, pg.index);
+    await applyTextEdits(doc, p, pg, new Map(), null);
+    [at] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
+  }
+  const { doc, p } = await isolatePage(at.src, at.index);
+  await edit(doc, p, await getModel(at));
+  const [np] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
+  pg.src = np.src; pg.index = np.index;
+  pg.objects = pg.objects.filter((o) => o.type !== 'tline');
+  RT.previews.delete(pg.id);
+}
+async function deleteShapes(pg, ns) {
+  endEdit();
+  const want = new Set(ns);
+  try {
+    await rebuildPage(pg, (doc, page) => {
+      const bytes = contentBytes(page);
+      const cut = [];
+      let n = 0;
+      for (const it of walkContent(bytes)) if (shapeItem(it)) { if (want.has(n)) cut.push(it.kind === 'path' ? [it.start, it.end] : [it.o.start, it.o.end]); n++; }
+      const chunks = [];
+      let last = 0;
+      for (const [a, b] of cut) { chunks.push(bytes.subarray(last, a)); last = b; }
+      chunks.push(bytes.subarray(last));
+      const out = new Uint8Array(chunks.reduce((t, c) => t + c.length, 0));
+      let q = 0;
+      for (const c of chunks) { out.set(c, q); q += c.length; }
+      page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(out)));
+    });
+    S.shapes = null; S.sel = null; S.multi = [];
+    commit();
+    showShapeSel(); renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
+    toast(`Deleted ${ns.length} shape${ns.length > 1 ? 's' : ''} · Ctrl+Z to undo`);
+  } catch (e) { console.error(e); toast('Could not delete: ' + e.message, 5000); }
+}
 async function isolatePage(src, index) {
   const doc = await PDFDocument.create();
   doc.registerFontkit(fontkit);
@@ -953,22 +1127,12 @@ async function deleteBand(pg, a, b) {
   endEdit();
   if (pg.blank || b - a < 1) return;
   try {
-    let at = pg;
-    if (pg.objects.some((o) => o.type === 'tline')) {
-      // bake pending text edits first, so the strip is cut from the page as it currently looks
-      const { doc, p } = await isolatePage(pg.src, pg.index);
-      await applyTextEdits(doc, p, pg, new Map(), null);
-      [at] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
-    }
-    const { doc, p } = await isolatePage(at.src, at.index);
-    cutPageBand(doc, p, pg, await getModel(at), a, b, S.defaults.cut.close);
-    const [np] = await loadSource(await doc.save({ useObjectStreams: false }), S.sources[pg.src].name);
     const moveUp = S.defaults.cut.close ? pg.objects.filter((o) => o.type !== 'tline' && objBBox(o, pg).y >= b - 0.5) : [];
-    pg.src = np.src; pg.index = np.index;
-    pg.objects = pg.objects.filter((o) => o.type !== 'tline');
+    // pending text edits are baked first, so the strip is cut from the page as it currently looks
+    await rebuildPage(pg, (doc, p, model) => cutPageBand(doc, p, pg, model, a, b, S.defaults.cut.close));
+    S.shapes = null;
     for (const o of moveUp) translateObj(o, JSON.parse(JSON.stringify(o)), 0, a - b);
     if (S.sel && !findObj(S.sel)) S.sel = null;
-    RT.previews.delete(pg.id);
     commit();
     renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
   } catch (e) {
@@ -1470,8 +1634,12 @@ async function marqueeSelect(pg, r, add) {
     }
   }
   setSel(add ? [...selIds(), ...ids] : ids);
+  // original shapes (bullets, rules, cell fills) lying wholly inside the box
+  const inside = (await getShapes(pg)).filter((s) => s.x >= r.x - 0.5 && s.y >= r.y - 0.5 && s.x + s.w <= r.x + r.w + 0.5 && s.y + s.h <= r.y + r.h + 0.5).map((s) => s.n);
+  setShapes(pg, inside, add);
 }
 function select(id) {
+  if (S.shapes) { S.shapes = null; showShapeSel(); }
   const prev = S.sel && findObj(S.sel);
   if (S.multi.length) { const pages = layersOf(S.multi); S.multi = []; pages.forEach((p) => p !== prev?.pg && renderLayer(p)); }
   S.sel = id;
@@ -1735,7 +1903,7 @@ let rafPending = false;
 function schedule(fn) { if (rafPending) return; rafPending = true; requestAnimationFrame(() => { rafPending = false; fn(); }); }
 
 $('#pages').addEventListener('pointermove', (e) => {
-  if (!drag) { if (S.tool === 'cut') hoverBand(e); return; }
+  if (!drag) { if (S.tool === 'cut') hoverBand(e); else if (S.tool === 'select') hoverShape(e); return; }
   const p = ptIn(drag.el, e);
   const { pg, o } = drag;
   if (drag.kind === 'cut') { if (Math.abs(p.y - drag.start.y) > 3) showBand(drag.el, Math.min(p.y, drag.start.y), Math.max(p.y, drag.start.y)); return; }
@@ -1793,7 +1961,7 @@ $('#pages').addEventListener('pointerup', async (e) => {
   if (d.kind === 'marquee') {
     d.rect.remove();
     const r = normRect(d.start, ptIn(d.el, e));
-    if (r.w < 3 && r.h < 3) return;
+    if (r.w < 3 && r.h < 3) { const s = !pg.blank && await shapeAt(pg, d.start); setShapes(s ? pg : null, s ? [s.n] : [], d.add); return; }
     await marqueeSelect(pg, r, d.add);
     return;
   }
@@ -1958,7 +2126,10 @@ function renderProps() {
   const f = S.sel && findObj(S.sel);
   const o = f?.o;
   let h = '';
-  if (S.multi.length > 1) h = multiProps();
+  if (S.shapes && !S.sel) h = `<div class="p-sec"><h3 class="p-title">${S.shapes.ns.length} shape${S.shapes.ns.length > 1 ? 's' : ''} selected</h3>
+    <p class="p-note">Original lines, bullets, boxes or images of the page. Shift+click adds more; drag a box to take everything inside it.</p>
+    <div class="p-actions" style="margin-top:8px"><button class="btn small danger" data-act="delete"><svg><use href="#i-trash"/></svg>Delete</button></div></div>`;
+  else if (S.multi.length > 1) h = multiProps();
   else if (o?.type === 'tline') h = tlineProps(f.pg, o);
   else if (o) h = objProps(o, false);
   else if (S.tool === 'cut') h = cutProps();
@@ -2210,6 +2381,7 @@ $('#fileFont').addEventListener('change', async (e) => {
 /* ================================================================ OBJECT OPS */
 function deleteSelected() {
   const ids = selIds();
+  if (S.shapes) { const sh = S.shapes, pg = pageById(sh.pg); S.shapes = null; if (pg) { if (ids.length) deleteSelected(); deleteShapes(pg, sh.ns); } return; }
   if (!ids.length) return;
   if (ids.length === 1) { const f = findObj(ids[0]); if (f?.o.type === 'tline') { deleteLineText(f.pg, f.o.key, false); return; } }
   endEdit();
@@ -3341,8 +3513,8 @@ document.addEventListener('keydown', (e) => {
   if (mod && k === 'd') { e.preventDefault(); duplicateSelected(); return; }
   if (mod && (k === 'c' || k === 'x')) { if (selIds().length) { e.preventDefault(); copySelected(k === 'x'); } return; }
   if (mod && k === 'a') { const pg = currentPage(); if (pg) { e.preventDefault(); const [W, H] = dispSize(pg); marqueeSelect(pg, { x: 0, y: 0, w: W, h: H }, false); } return; }
-  if (e.key === 'Delete' || e.key === 'Backspace') { if (S.sel) { e.preventDefault(); deleteSelected(); } return; }
-  if (e.key === 'Escape') { if (!$('#findbar').hidden) closeFind(); else if (S.sel) select(null); else setTool('select'); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') { if (S.sel || S.shapes) { e.preventDefault(); deleteSelected(); } return; }
+  if (e.key === 'Escape') { if (!$('#findbar').hidden) closeFind(); else if (S.sel || S.shapes) select(null); else setTool('select'); return; }
   if (e.key === 'Enter' && S.sel) { const f = findObj(S.sel); if (f?.o.type === 'text') editTextObj(f.pg, f.o, null); else if (f?.o.type === 'tline') editLine(f.pg, f.o.key, null); return; }
   if (e.key.startsWith('Arrow') && S.sel) {
     e.preventDefault();

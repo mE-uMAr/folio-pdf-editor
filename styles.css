@@ -341,3 +341,7 @@ svg.vec .hitpath { pointer-events: stroke; stroke: transparent; cursor: move; }
   .tb span, .brand-name, .file { display: none; }
   .findbar { left: 16px; right: 16px; width: auto; }
 }
+/* original page shapes (bullets, rules, cell fills) */
+.shape-sel, .shape-hover { position: absolute; pointer-events: none; border-radius: 1px; }
+.shape-sel { box-shadow: 0 0 0 1.5px var(--accent), 0 0 0 4px var(--accent-soft); }
+.shape-hover { box-shadow: 0 0 0 1px rgba(31, 95, 209, .55); background: rgba(31, 95, 209, .08); }
