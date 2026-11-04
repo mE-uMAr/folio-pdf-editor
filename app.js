@@ -8,7 +8,7 @@
 const {
   PDFDocument, StandardFonts, rgb, degrees, BlendMode, LineCapStyle, PDFName, PDFHexString,
   pushGraphicsState, popGraphicsState, beginText, endText, setFontAndSize, setTextMatrix, showText,
-  setFillingRgbColor, setStrokingRgbColor, setTextRenderingMode, setLineWidth,
+  setFillingRgbColor, setStrokingRgbColor, setTextRenderingMode, setLineWidth, moveTo, lineTo, stroke,
 } = PDFLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
 const OPS = pdfjsLib.OPS;
@@ -579,11 +579,13 @@ function layoutLine(model, line, text) {
 /* ---- an edited line as placed: line breaks, alignment against the original line, and any move ---- */
 const tlineMoved = (o) => !!(o.off && (o.off[0] || o.off[1]));
 // a line that is only selected (not edited) needs no preview rebuild
-const tlineLive = (o) => o.base == null || o.text !== o.base || tlineMoved(o) || (!!o.align && o.align !== 'left');
+// underline wanted vs the underline the original line had (o.ul: the detected rule, or false)
+const ulDiff = (o) => o.underline != null && !!o.underline !== !!o.ul;
+const tlineLive = (o) => o.base == null || o.text !== o.base || tlineMoved(o) || (!!o.align && o.align !== 'left') || ulDiff(o);
 const hitsOn = () => S.tool === 'edit' || S.tool === 'select';
-const tlineChanged = (o, line) => o.text !== line.text || tlineMoved(o) || (!!o.align && o.align !== 'left');
+const tlineChanged = (o, line) => o.text !== line.text || tlineMoved(o) || (!!o.align && o.align !== 'left') || ulDiff(o);
 function layoutEdit(pg, model, line, o) {
-  if (!o.text.includes('\n') && !tlineMoved(o) && (!o.align || o.align === 'left')) return layoutLine(model, line, o.text);
+  if (!o.text.includes('\n') && !tlineMoved(o) && (!o.align || o.align === 'left')) return layoutLine(model, line, o.text).map((u) => ({ ...u, row: 0 }));
   const ref = line.units.find((u) => !u.syn) || line.units[0];
   const M = ref.M, al = Math.hypot(M[0], M[1]) || 1, dir = [M[0] / al, M[1] / al];
   // extent of the inked characters along the baseline (user space)
@@ -612,7 +614,7 @@ function layoutEdit(pg, model, line, o) {
     if (sp && o.align === 'right') shift = b0 - sp[1];
     else if (sp && (o.align === 'center' || o.align === 'page')) shift = mid - (sp[0] + sp[1]) / 2;
     const tx = shift * dir[0] - i * LINE_H * M[2] + off[0], ty = shift * dir[1] - i * LINE_H * M[3] + off[1];
-    for (const u of units) out.push({ ...u, M: [u.M[0], u.M[1], u.M[2], u.M[3], u.M[4] + tx, u.M[5] + ty] });
+    for (const u of units) out.push({ ...u, row: i, M: [u.M[0], u.M[1], u.M[2], u.M[3], u.M[4] + tx, u.M[5] + ty] });
   });
   return out;
 }
@@ -1096,25 +1098,68 @@ async function deleteShapes(pg, ns) {
   endEdit();
   const want = new Set(ns);
   try {
-    await rebuildPage(pg, (doc, page) => {
-      const bytes = contentBytes(page);
-      const cut = [];
-      let n = 0;
-      for (const it of walkContent(bytes)) if (shapeItem(it)) { if (want.has(n)) cut.push(it.kind === 'path' ? [it.start, it.end] : [it.o.start, it.o.end]); n++; }
-      const chunks = [];
-      let last = 0;
-      for (const [a, b] of cut) { chunks.push(bytes.subarray(last, a)); last = b; }
-      chunks.push(bytes.subarray(last));
-      const out = new Uint8Array(chunks.reduce((t, c) => t + c.length, 0));
-      let q = 0;
-      for (const c of chunks) { out.set(c, q); q += c.length; }
-      page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(out)));
-    });
+    // baking edited lines removes their old underline rules first, which shifts later shape numbers
+    const gone = pg.objects.filter((o) => o.type === 'tline' && o.ul && tlineLive(o)).map((o) => o.ul.n);
+    const shifted = new Set([...want].filter((n) => !gone.includes(n)).map((n) => n - gone.filter((g) => g < n).length));
+    await rebuildPage(pg, (doc, page) => cutShapes(doc, page, shifted));
     S.shapes = null; S.sel = null; S.multi = [];
     commit();
     showShapeSel(); renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
     toast(`Deleted ${ns.length} shape${ns.length > 1 ? 's' : ''} · Ctrl+Z to undo`);
   } catch (e) { console.error(e); toast('Could not delete: ' + e.message, 5000); }
+}
+// remove original shapes (by their order among the page's shapes) from a page's content
+function cutShapes(doc, page, want) {
+  if (!want.size) return;
+  const bytes = contentBytes(page);
+  const cut = [];
+  let n = 0;
+  for (const it of walkContent(bytes)) if (shapeItem(it)) { if (want.has(n)) cut.push(it.kind === 'path' ? [it.start, it.end] : [it.o.start, it.o.end]); n++; }
+  const chunks = [];
+  let last = 0;
+  for (const [a, b] of cut) { chunks.push(bytes.subarray(last, a)); last = b; }
+  chunks.push(bytes.subarray(last));
+  const out = new Uint8Array(chunks.reduce((t, c) => t + c.length, 0));
+  let q = 0;
+  for (const c of chunks) { out.set(c, q); q += c.length; }
+  page.node.set(PDFName.of('Contents'), doc.context.register(doc.context.flateStream(out)));
+}
+// A thin rule just below a line of text, spanning most of it: that line's underline.
+async function findUnderline(pg, model, line) {
+  const vp = viewportFor(pg, 1), b = unitsBBox(model, line.units, vp);
+  const ref = line.units.find((u) => !u.syn && u.t.trim()) || line.units[0];
+  const D = mul(vp, ref.M), base = D[5], size = Math.hypot(D[2], D[3]);
+  let best = null;
+  for (const s of await getShapes(pg)) {
+    if (s.h > Math.max(3, size * 0.15) || s.y + s.h / 2 < base - size * 0.05 || s.y > base + size * 0.5) continue;
+    const ov = Math.min(s.x + s.w, b.x + b.w) - Math.max(s.x, b.x);
+    if (ov < b.w * 0.5 || s.w > b.w * 1.8 + size) continue;
+    if (!best || Math.abs(s.y - base) < Math.abs(best.y - base)) best = s;
+  }
+  return best ? { n: best.n, t: round(Math.max(0.4, best.h), 2), dy: round(best.y + best.h / 2 - base, 2) } : false;
+}
+async function ensureUnderline(pg, model, o) {
+  if (o.ul !== undefined) return;
+  const line = model.lines[o.key];
+  o.ul = line ? await findUnderline(pg, model, line) : false;
+  if (o.ul && o.underline == null) o.underline = true;
+}
+// underline rules for an edited line, one per row, in the text's own direction and colour
+function drawUnderlines(page, model, units, o) {
+  const rows = new Map();
+  for (const u of units) if (u.t.trim()) { if (!rows.has(u.row || 0)) rows.set(u.row || 0, []); rows.get(u.row || 0).push(u); }
+  const ops = [pushGraphicsState()];
+  for (const us of rows.values()) {
+    const a = us[0], z = us[us.length - 1], st = model.styles[a.si];
+    const yl = Math.hypot(a.M[2], a.M[3]) || 1, dn = [-a.M[2] / yl, -a.M[3] / yl];
+    const dy = o.ul ? o.ul.dy : yl * 0.12, t = o.ul ? o.ul.t : Math.max(0.5, yl * 0.06);
+    const [r, g, b] = hex2rgb(st.fill);
+    const x1 = a.M[4] + dn[0] * dy, y1 = a.M[5] + dn[1] * dy;
+    const x2 = z.M[4] + z.adv * z.M[0] + dn[0] * dy, y2 = z.M[5] + z.adv * z.M[1] + dn[1] * dy;
+    ops.push(setStrokingRgbColor(r / 255, g / 255, b / 255), setLineWidth(t), moveTo(x1, y1), lineTo(x2, y2), stroke());
+  }
+  ops.push(popGraphicsState());
+  if (rows.size) page.pushOperators(...ops);
 }
 async function isolatePage(src, index) {
   const doc = await PDFDocument.create();
@@ -1220,6 +1265,8 @@ async function applyTextEdits(doc, page, pg, cache, stats) {
     try { removeShowOps(doc, page, model, removeSet); removedOK = true; }
     catch (err) { console.warn('content-stream edit fell back to cover mode:', err.message); }
   }
+  try { cutShapes(doc, page, new Set(edited.filter((x) => x.e.ul).map((x) => x.e.ul.n))); }
+  catch (err) { console.warn('old underline kept:', err.message); }
   wrapContents(doc, page);
   const editedKeys = new Set(edited.map((x) => x.e.key));
   if (!removedOK) coverLines.push(...edited.filter((x) => x.line.removable));
@@ -1242,7 +1289,11 @@ async function applyTextEdits(doc, page, pg, cache, stats) {
     });
     if (keep.length) await drawUnits(doc, page, model, keep, cache, null);
   }
-  for (const { line, e } of edited) await drawUnits(doc, page, model, layoutEdit(pg, model, line, e), cache, stats);
+  for (const { line, e } of edited) {
+    const units = layoutEdit(pg, model, line, e);
+    await drawUnits(doc, page, model, units, cache, stats);
+    if (e.underline ?? !!e.ul) drawUnderlines(page, model, units, e);
+  }
 }
 function invertM(m) {
   const d = m[0] * m[3] - m[1] * m[2];
@@ -1683,6 +1734,7 @@ async function editLine(pg, key, ev) {
   if (!line?.editable) return;
   endEdit();
   const o = tlineAt(pg, model, key);
+  await ensureUnderline(pg, model, o);
   const vp = viewportFor(pg, 1);
   S.sel = o.id;
   const before = o.text;
@@ -2163,7 +2215,8 @@ function tlineProps(pg, o) {
     <div class="p-sec"><div class="p-actions">
       <button class="btn small" data-act="edit-tline">Edit text</button>
       <button class="btn small" data-act="revert">Revert to original</button>
-      <button class="btn small" data-act="tl-font" title="New text boxes will use this font, size and colour">Use font for new text</button></div></div>
+      <button class="btn small" data-act="tl-font" title="New text boxes will use this font, size and colour">Use font for new text</button></div>
+    <div class="p-row" style="margin-top:8px"><label>Style</label><span class="seg"><button data-act="tl-ul" class="${(o.underline ?? !!o.ul) ? 'on' : ''}" title="Underline (fits the new text; an existing underline is resized)"><u>U</u></button></span></div></div>
     <div class="p-sec"><div class="p-actions">
       <button class="btn small danger" data-act="del-line">Delete text</button>
       <button class="btn small danger" data-act="del-same" id="tlSame" hidden></button></div></div>`;
@@ -2305,6 +2358,17 @@ $('#props').addEventListener('click', (e) => {
   if (act === 'edit-tline' && f) editLine(f.pg, f.o.key, null);
   if (act === 'revert' && f) { f.pg.objects = f.pg.objects.filter((x) => x !== f.o); S.sel = null; commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); toast('Original text restored'); }
   if ((act === 'tl-align' || act === 'tl-reset') && f) alignTline(f.pg, f.o, act === 'tl-reset' ? null : b.dataset.val);
+  if (act === 'tl-ul' && f) {
+    const { pg, o } = f;
+    endEdit();
+    getModel(pg).then(async (m) => {
+      await ensureUnderline(pg, m, o);
+      o.underline = !(o.underline ?? !!o.ul);
+      if (!pg.objects.includes(o)) pg.objects.unshift(o);
+      S.sel = o.id;
+      commit(); renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
+    });
+  }
   if (act === 'font-upload') $('#fileFont').click();
   if (act === 'copy') copySelected(false);
   if (act === 'tl-font' && f) {
