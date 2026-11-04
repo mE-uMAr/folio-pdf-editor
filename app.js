@@ -48,7 +48,7 @@ const STD_FONTS = {
 };
 
 const S = {
-  sources: [], pages: [], zoom: 1, zoomMode: 'fitw', tool: 'select', sel: null, editing: null,
+  sources: [], pages: [], zoom: 1, zoomMode: 'fitw', tool: 'select', sel: null, multi: [], editing: null,
   fileName: 'document.pdf', fileHandle: null, images: {}, dirty: false, clip: null, fx: { bw: false, scan: false },
   defaults: {
     text: { font: 'Helvetica', size: 14, bold: false, italic: false, underline: false, color: '#111111', align: 'left', opacity: 1 },
@@ -127,8 +127,9 @@ function restore(s) {
   const before = structKey();
   S.pages = JSON.parse(s);
   if (S.sel && !findObj(S.sel)) S.sel = null;
+  S.multi = S.multi.filter((id) => findObj(id));
   if (structKey() !== before) buildViewer();
-  else S.pages.forEach((pg) => { renderLayer(pg); refreshCanvas(pg); if (S.tool === 'edit') renderHits(pg); });
+  else S.pages.forEach((pg) => { renderLayer(pg); refreshCanvas(pg); if (hitsOn()) renderHits(pg); });
   renderProps(); setDirty(true);
 }
 function undo() { endEdit(); if (H.i > 0) { H.i--; restore(H.stack[H.i]); updateUndo(); } }
@@ -155,7 +156,7 @@ async function openBytes(bytes, name, handle = null) {
     for (const s of S.sources) s.doc.destroy();
     for (const p of RT.previews.values()) p.doc?.destroy?.();
     Object.assign(RT, { models: new Map(), libDocs: new Map(), fonts: new Map(), previews: new Map(), geoms: new Map() });
-    S.sources = []; S.images = {}; S.sel = null;
+    S.sources = []; S.images = {}; S.sel = null; S.multi = [];
     setFx('bw', false, true); setFx('scan', false, true);
     S.pages = await loadSource(bytes, name);
     S.fileName = name; S.fileHandle = handle;
@@ -341,7 +342,10 @@ function groupLines(glyphs, styles, page) {
     const garbled = [...text].filter((c) => c === '\uFFFD' || (c >= '\uE000' && c <= '\uF8FF')).length > text.length * 0.3;
     const ops = new Set(gl.map((g) => g.op));
     const removable = gl.every((g) => g.op >= 0);
-    return { key, units: ln.units, text, editable: !bad && !garbled && text.trim().length > 0, ops, removable, glyphIdx: ln.glyphIdx };
+    const editable = !bad && !garbled && text.trim().length > 0;
+    // bullets and symbol glyphs can't be retyped, but they can still be selected and deleted
+    const deletable = editable || (removable && gl.length > 0 && !gl.every((g) => g.inv) && !gl.every((g) => g.isSpace || !g.u.trim()));
+    return { key, units: ln.units, text, editable, deletable, ops, removable, glyphIdx: ln.glyphIdx };
   });
 }
 
@@ -572,6 +576,9 @@ function layoutLine(model, line, text) {
 
 /* ---- an edited line as placed: line breaks, alignment against the original line, and any move ---- */
 const tlineMoved = (o) => !!(o.off && (o.off[0] || o.off[1]));
+// a line that is only selected (not edited) needs no preview rebuild
+const tlineLive = (o) => o.base == null || o.text !== o.base || tlineMoved(o) || (!!o.align && o.align !== 'left');
+const hitsOn = () => S.tool === 'edit' || S.tool === 'select';
 const tlineChanged = (o, line) => o.text !== line.text || tlineMoved(o) || (!!o.align && o.align !== 'left');
 function layoutEdit(pg, model, line, o) {
   if (!o.text.includes('\n') && !tlineMoved(o) && (!o.align || o.align === 'left')) return layoutLine(model, line, o.text);
@@ -611,7 +618,7 @@ function tlineAt(pg, model, key) {
   let o = tlineFor(pg, key);
   if (!o) {
     const line = model.lines[key];
-    o = { id: uid(), type: 'tline', key, text: line.text, bg: sampleBg(pg, unitsBBox(model, line.units, viewportFor(pg, 1))) };
+    o = { id: uid(), type: 'tline', key, text: line.text, base: line.text, bg: sampleBg(pg, unitsBBox(model, line.units, viewportFor(pg, 1))) };
     pg.objects.unshift(o);
   }
   return o;
@@ -637,7 +644,7 @@ function unitsBBox(model, units, vp) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 function tlineFor(pg, key) { return pg.objects.find((o) => o.type === 'tline' && o.key === key); }
-const tlineSig = (pg) => JSON.stringify([pg.src, pg.index, ...pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o.text, o.bg, o.off, o.align])]);
+const tlineSig = (pg) => JSON.stringify([pg.src, pg.index, ...pg.objects.filter((o) => o.type === 'tline' && tlineLive(o)).map((o) => [o.key, o.text, o.bg, o.off, o.align])]);
 
 /* ================================================================ CONTENT STREAM SURGERY */
 function contentBytes(page) {
@@ -1082,7 +1089,7 @@ function invertM(m) {
 async function renderSourcePage(pg) {
   if (pg.blank) return null;
   const sig = tlineSig(pg);
-  const hasEdits = pg.objects.some((o) => o.type === 'tline');
+  const hasEdits = pg.objects.some((o) => o.type === 'tline' && tlineLive(o));
   if (!hasEdits) return { page: await getPdfPage(pg), sig };
   const cached = RT.previews.get(pg.id);
   if (cached && cached.sig === sig) return { page: await cached.page, sig };
@@ -1123,7 +1130,7 @@ function buildViewer() {
     for (const en of entries) {
       const pg = pageById(en.target.dataset.id);
       if (!pg) continue;
-      if (en.isIntersecting) { renderCanvas(pg, en.target); if (S.tool === 'edit') renderHits(pg); }
+      if (en.isIntersecting) { renderCanvas(pg, en.target); if (hitsOn()) renderHits(pg); }
     }
   }, { root: $('#viewport'), rootMargin: '900px 0px' });
   S.pages.forEach((pg, i) => host.appendChild(buildPageEl(pg, i)));
@@ -1203,7 +1210,7 @@ async function renderHits(pg) {
   for (const ln of model.lines) repeats.set(ln.text, (repeats.get(ln.text) || 0) + 1);
   const under = [], over = [];
   for (const ln of model.lines) {
-    if (!ln.editable) continue;
+    if (!ln.deletable) continue;
     const t = edits.get(ln.key);
     if (t && !t.text.trim()) continue; // deleted text is gone, not an empty field
     const units = t ? layoutEdit(pg, model, ln, t) : ln.units;
@@ -1211,7 +1218,7 @@ async function renderHits(pg) {
     if (!isHorizontalInDisplay(pg, ref.M)) continue;
     const bb = unitsBBox(model, units.length ? units : ln.units, vp);
     const d = document.createElement('div');
-    d.className = 'hit'; d.dataset.key = ln.key;
+    d.className = 'hit' + (ln.editable ? '' : ' ro'); d.dataset.key = ln.key;
     Object.assign(d.style, { left: (bb.x - 1) * z + 'px', top: (bb.y - 1) * z + 'px', width: (bb.w + 2) * z + 'px', height: (bb.h + 2) * z + 'px' });
     (repeats.get(ln.text) >= 4 ? under : over).push(d);
   }
@@ -1233,7 +1240,11 @@ function imgUrl(id) {
   }
   return RT.imgUrls.get(id);
 }
+// a text box can use one of the document's own fonts ('pdf:<name>'); missing characters fall back
+const docFont = (o) => (typeof o.font === 'string' && o.font.startsWith('pdf:') ? RT.fonts.get(o.font.slice(4)) || null : null);
 function textCss(o) {
+  const df = docFont(o);
+  if (df) return df.css ? `${df.css}, ${fallbackCss(fallbackFor(df))}` : fallbackCss(fallbackFor(df));
   const cf = RT.customFonts.get(o.font);
   return cf ? `"${cf.family}", Arial, sans-serif` : STD_CSS[o.font] || STD_CSS.Helvetica;
 }
@@ -1340,9 +1351,10 @@ async function renderLayer(pg) {
     const t = layer.querySelector(`[data-oid="${o.id}"]`);
     if (t) { o._w = t.offsetWidth / z; o._h = t.offsetHeight / z; }
   }
-  if (S.sel) {
-    const f = findObj(S.sel);
-    if (f && f.pg === pg) drawSelection(pg, f.o, layer);
+  const ids = selIds();
+  for (const id of ids) {
+    const f = findObj(id);
+    if (f && f.pg === pg) drawSelection(pg, f.o, layer, ids.length === 1);
   }
 }
 const union = (a, b) => { const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y); return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y }; };
@@ -1406,7 +1418,7 @@ function objBBox(o, pg) {
     default: return { x: o.x, y: o.y, w: o.w, h: o.h };
   }
 }
-function drawSelection(pg, o, layer) {
+function drawSelection(pg, o, layer, handles = true) {
   const z = S.zoom;
   const bb = objBBox(o, pg);
   const sb = document.createElement('div');
@@ -1419,6 +1431,7 @@ function drawSelection(pg, o, layer) {
     Object.assign(d.style, { left: x * z + 'px', top: y * z + 'px' });
     layer.appendChild(d);
   };
+  if (!handles) return;
   if (['box', 'ellipse', 'image'].includes(o.type)) {
     const { x, y, w, h } = bb;
     add('nw', x, y); add('n', x + w / 2, y); add('ne', x + w, y); add('e', x + w, y + h / 2);
@@ -1426,8 +1439,41 @@ function drawSelection(pg, o, layer) {
   } else if (o.type === 'line') { add('p1', o.x1, o.y1); add('p2', o.x2, o.y2); }
   else if (o.type === 'text' && S.editing !== o.id) add('fs', bb.x + bb.w, bb.y + bb.h);
 }
+const selIds = () => (S.multi.length ? S.multi : S.sel ? [S.sel] : []);
+function layersOf(ids) { return new Set(ids.map(findObj).filter(Boolean).map((f) => f.pg)); }
+function setSel(ids) {
+  const before = layersOf(selIds());
+  ids = [...new Set(ids)].filter((id) => findObj(id));
+  S.multi = ids.length > 1 ? ids : [];
+  S.sel = ids[ids.length - 1] || null;
+  for (const p of new Set([...before, ...layersOf(ids)])) renderLayer(p);
+  renderProps();
+}
+function toggleSel(id) { const ids = selIds(); setSel(ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]); }
+function startMove(pg, o, start, el) {
+  const ids = selIds().includes(o.id) ? selIds() : [o.id];
+  const items = ids.map(findObj).filter(Boolean).map((f) => ({ pg: f.pg, o: f.o, orig: JSON.parse(JSON.stringify(f.o)) }));
+  return { kind: 'move', pg, o, items, pages: [...new Set(items.map((i) => i.pg))], start, el, moved: false };
+}
+// everything a dragged box touches: placed objects and lines of existing text (bullets included)
+async function marqueeSelect(pg, r, add) {
+  const hitR = (b) => b.x < r.x + r.w && b.x + b.w > r.x && b.y < r.y + r.h && b.y + b.h > r.y;
+  const ids = pg.objects.filter((o) => o.type !== 'tline' && hitR(objBBox(o, pg))).map((o) => o.id);
+  if (!pg.blank) {
+    const model = await getModel(pg), vp = viewportFor(pg, 1);
+    for (const ln of model.lines) {
+      if (!ln.deletable) continue;
+      const t = tlineFor(pg, ln.key);
+      if (t && !t.text) continue;
+      const units = t ? layoutEdit(pg, model, ln, t) : ln.units;
+      if (hitR(unitsBBox(model, units.length ? units : ln.units, vp))) ids.push(tlineAt(pg, model, ln.key).id);
+    }
+  }
+  setSel(add ? [...selIds(), ...ids] : ids);
+}
 function select(id) {
   const prev = S.sel && findObj(S.sel);
+  if (S.multi.length) { const pages = layersOf(S.multi); S.multi = []; pages.forEach((p) => p !== prev?.pg && renderLayer(p)); }
   S.sel = id;
   if (prev) renderLayer(prev.pg);
   const f = id && findObj(id);
@@ -1610,13 +1656,13 @@ $('#pages').addEventListener('pointerdown', async (e) => {
     el.setPointerCapture(e.pointerId);
     return;
   }
-  // edit existing text
-  // existing text with the edit tool: click to edit, drag to move the line
+  // existing text: click to edit (edit tool) or select (select tool, bullets), drag to move the line
   const hit = e.target.closest('.hit');
   const tl = oid && findObj(oid)?.o;
-  if (tool === 'edit' && (hit || tl?.type === 'tline')) {
+  const add = e.shiftKey || e.ctrlKey || e.metaKey;
+  if ((tool === 'edit' && (hit || tl?.type === 'tline')) || (tool === 'select' && hit && !oid)) {
     e.preventDefault(); endEdit();
-    const d = { kind: 'tpress', pg, key: tl?.type === 'tline' ? tl.key : +hit.dataset.key, start: p, el, model: null };
+    const d = { kind: 'tpress', pg, key: tl?.type === 'tline' ? tl.key : +hit.dataset.key, start: p, el, model: null, add, dbl: e.detail >= 2 };
     drag = d;
     getModel(pg).then((m) => { d.model = m; });
     el.setPointerCapture(e.pointerId);
@@ -1629,21 +1675,32 @@ $('#pages').addEventListener('pointerdown', async (e) => {
     if (f.o.type === 'tline' && (tool !== 'select' || e.detail >= 2)) { e.preventDefault(); editLine(pg, f.o.key, e); return; }
     if (f.o.type === 'text' && (tool === 'text' || e.detail >= 2)) { e.preventDefault(); editTextObj(pg, f.o, e); return; }
     e.preventDefault(); endEdit();
-    if (S.sel !== oid) select(oid);
-    drag = { kind: 'move', pg, o: f.o, start: p, orig: JSON.parse(JSON.stringify(f.o)), el, moved: false };
+    if (add) { toggleSel(oid); return; }
+    if (!selIds().includes(oid)) select(oid);
+    drag = startMove(pg, f.o, p, el);
     el.setPointerCapture(e.pointerId);
     return;
   }
   e.preventDefault();
   endEdit();
-  if (tool === 'select' || tool === 'edit') { select(null); return; }
+  if (tool === 'select') {
+    if (!add) select(null);
+    drag = { kind: 'marquee', pg, start: p, el, add, rect: document.createElement('div') };
+    drag.rect.className = 'drag-rect';
+    el.querySelector('.marks').appendChild(drag.rect);
+    el.setPointerCapture(e.pointerId);
+    return;
+  }
+  if (tool === 'edit') { select(null); return; }
   if (tool === 'cut') {
     drag = { kind: 'cut', pg, start: p, el };
     el.setPointerCapture(e.pointerId);
     return;
   }
   if (tool === 'text') {
-    const d = S.defaults.text;
+    const d = { ...S.defaults.text };
+    if (d.match !== false) { const m = await nearbyStyle(pg, p); if (m) { delete m.D; Object.assign(d, m); } }
+    delete d.match;
     const o = { id: uid(), type: 'text', x: p.x, y: p.y - d.size * 0.6, text: '', ...d };
     pg.objects.push(o);
     editTextObj(pg, o, null);
@@ -1685,18 +1742,23 @@ $('#pages').addEventListener('pointermove', (e) => {
   if (drag.kind === 'tpress') {
     if (!drag.model || Math.hypot(p.x - drag.start.x, p.y - drag.start.y) * S.zoom < 4) return;
     const t = tlineAt(pg, drag.model, drag.key);
-    S.sel = t.id;
-    drag = { kind: 'move', pg, o: t, start: drag.start, orig: JSON.parse(JSON.stringify(t)), el: drag.el, moved: true };
+    if (!selIds().includes(t.id)) { S.sel = t.id; S.multi = []; }
+    drag = startMove(pg, t, drag.start, drag.el);
+    drag.moved = true;
     renderProps();
   }
+  if (drag.kind === 'marquee') {
+    const r = normRect(drag.start, p), z = S.zoom;
+    Object.assign(drag.rect.style, { left: r.x * z + 'px', top: r.y * z + 'px', width: r.w * z + 'px', height: r.h * z + 'px' });
+    return;
+  }
   if (drag.kind === 'move') {
-    const { o } = drag;
     let dx = p.x - drag.start.x, dy = p.y - drag.start.y;
     if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
     if (Math.abs(dx) + Math.abs(dy) > 0.5) drag.moved = true;
-    if (o.type === 'tline') { moveTline(pg, o, drag.orig.off, dx, dy); schedule(() => renderLayer(pg)); return; }
-    translateObj(o, drag.orig, dx, dy);
-    schedule(() => renderLayer(pg));
+    for (const it of drag.items) { if (it.o.type === 'tline') moveTline(it.pg, it.o, it.orig.off, dx, dy); else translateObj(it.o, it.orig, dx, dy); }
+    const pages = drag.pages;
+    schedule(() => pages.forEach((x) => renderLayer(x)));
   } else if (drag.kind === 'resize') {
     resizeObj(o, drag.orig, drag.h, p, drag.start, e.shiftKey);
     schedule(() => { renderLayer(pg); renderProps(); });
@@ -1719,10 +1781,26 @@ $('#pages').addEventListener('pointerup', async (e) => {
   if (!drag) return;
   const d = drag; drag = null;
   const { pg } = d;
-  if (d.kind === 'tpress') { editLine(pg, d.key, e); return; }
-  if (d.kind === 'move' && d.o.type === 'tline') {
-    commit(); renderLayer(pg); renderProps();
-    if (d.moved) { refreshCanvas(pg); renderHits(pg); }
+  if (d.kind === 'tpress') {
+    const model = d.model || await getModel(pg);
+    const line = model.lines[d.key];
+    if (!line) return;
+    if (!d.add && line.editable && (S.tool === 'edit' || d.dbl)) { editLine(pg, d.key, e); return; }
+    const t = tlineAt(pg, model, d.key);
+    if (d.add) toggleSel(t.id); else select(t.id);
+    return;
+  }
+  if (d.kind === 'marquee') {
+    d.rect.remove();
+    const r = normRect(d.start, ptIn(d.el, e));
+    if (r.w < 3 && r.h < 3) return;
+    await marqueeSelect(pg, r, d.add);
+    return;
+  }
+  if (d.kind === 'move') {
+    commit();
+    for (const x of d.pages) { renderLayer(x); if (d.moved && d.items.some((i) => i.pg === x && i.o.type === 'tline')) { refreshCanvas(x); renderHits(x); } }
+    renderProps();
     return;
   }
   if (d.kind === 'cut') {
@@ -1761,7 +1839,7 @@ $('#pages').addEventListener('pointerup', async (e) => {
   } else if (d.kind === 'draw') {
     if (d.o.points.length === 1) d.o.points.push([d.o.points[0][0] + 0.1, d.o.points[0][1]]);
     commit(); renderLayer(pg);
-  } else if (d.kind === 'move' || d.kind === 'resize') {
+  } else if (d.kind === 'resize') {
     commit(); renderLayer(pg); renderProps();
   }
 });
@@ -1836,7 +1914,7 @@ async function textAwareBoxes(pg, r, click) {
 
 /* ================================================================ TOOLS */
 const HINTS = {
-  select: 'Select, move and resize. Double-click text to edit. Delete removes; arrows nudge (Shift = 10pt).',
+  select: 'Click anything (existing text and bullets too) to select; Shift+click or drag a box for several. Delete removes, Ctrl+C/V copies, arrows nudge.',
   edit: 'Click any line of existing text to edit it in its original font, size and colour; drag it to move. Enter to finish, Shift+Enter for a new line, Esc to cancel.',
   text: 'Click to add a text box. Shift+Enter for a new line while typing.',
   whiteout: 'Drag to cover an area with a solid box.',
@@ -1860,7 +1938,7 @@ function setTool(t) {
   const host = $('#pages');
   host.className = 'pages t-' + t;
   $('#hint').textContent = S.pages.length ? HINTS[t] : 'Open a PDF to begin.';
-  if (t === 'edit') {
+  if (hitsOn()) {
     const vr = $('#viewport').getBoundingClientRect();
     S.pages.forEach((pg) => {
       const r = pageEl(pg.id)?.getBoundingClientRect();
@@ -1880,7 +1958,8 @@ function renderProps() {
   const f = S.sel && findObj(S.sel);
   const o = f?.o;
   let h = '';
-  if (o?.type === 'tline') h = tlineProps(f.pg, o);
+  if (S.multi.length > 1) h = multiProps();
+  else if (o?.type === 'tline') h = tlineProps(f.pg, o);
   else if (o) h = objProps(o, false);
   else if (S.tool === 'cut') h = cutProps();
   else if (S.defaults[S.tool]) h = objProps({ type: toolType(S.tool), ...S.defaults[S.tool], kind: S.tool }, true);
@@ -1912,10 +1991,18 @@ function tlineProps(pg, o) {
       <p class="p-note" style="margin-top:6px">Drag the text to move it; arrow keys nudge (Shift = 10pt).</p></div>
     <div class="p-sec"><div class="p-actions">
       <button class="btn small" data-act="edit-tline">Edit text</button>
-      <button class="btn small" data-act="revert">Revert to original</button></div></div>
+      <button class="btn small" data-act="revert">Revert to original</button>
+      <button class="btn small" data-act="tl-font" title="New text boxes will use this font, size and colour">Use font for new text</button></div></div>
     <div class="p-sec"><div class="p-actions">
       <button class="btn small danger" data-act="del-line">Delete text</button>
       <button class="btn small danger" data-act="del-same" id="tlSame" hidden></button></div></div>`;
+}
+function multiProps() {
+  return `<div class="p-sec"><h3 class="p-title">${S.multi.length} items selected</h3>
+    <p class="p-note">Drag any of them to move all; arrow keys nudge. Shift+click adds or removes an item, drag a box on empty page to select an area.</p></div>
+    <div class="p-sec"><div class="p-actions">
+      <button class="btn small" data-act="copy"><svg><use href="#i-copy"/></svg>Copy</button>
+      <button class="btn small danger" data-act="delete"><svg><use href="#i-trash"/></svg>Delete all</button></div></div>`;
 }
 function cutProps() {
   return `<div class="p-sec"><h3 class="p-title">Delete row</h3>
@@ -1952,7 +2039,13 @@ function objProps(o, isDefault) {
   let h = `<div class="p-sec"><h3 class="p-title">${title}${isDefault ? ' defaults' : ''}</h3>`;
   if (o.type === 'text') {
     const fonts = ['Helvetica', 'Times', 'Courier', ...RT.customFonts.keys()];
-    h += `<div class="p-row"><label for="pFont">Font</label><select id="pFont" data-prop="font">${fonts.map((f) => `<option value="${esc(f)}" ${f === o.font ? 'selected' : ''}>${esc(f === 'Helvetica' ? 'Helvetica / Arial' : f === 'Times' ? 'Times' : f)}</option>`).join('')}<option value="__upload">Load font file…</option></select></div>
+    const seen = new Set(), docFonts = [];
+    for (const [n, i] of RT.fonts) if (i.css && i.psName && !seen.has(i.psName)) { seen.add(i.psName); docFonts.push(['pdf:' + n, i.psName]); }
+    if (docFont(o) && !docFonts.some(([v]) => v === o.font)) docFonts.unshift([o.font, docFont(o).psName]);
+    h += `<div class="p-row"><label for="pFont">Font</label><select id="pFont" data-prop="font">${fonts.map((f) => `<option value="${esc(f)}" ${f === o.font ? 'selected' : ''}>${esc(f === 'Helvetica' ? 'Helvetica / Arial' : f === 'Times' ? 'Times' : f)}</option>`).join('')}` +
+      (docFonts.length ? `<optgroup label="From this document">${docFonts.map(([v, l]) => `<option value="${esc(v)}" ${v === o.font ? 'selected' : ''}>${esc(l)}</option>`).join('')}</optgroup>` : '') +
+      `<option value="__upload">Load font file…</option></select></div>
+      ${isDefault ? `<label class="check"><input type="checkbox" data-check="match" ${o.match !== false ? 'checked' : ''}> Match the nearest document text (font, size, colour)</label>` : `<div class="p-actions"><button class="btn small" data-act="match-near">Match nearby text</button></div>`}
       <div class="p-row"><label for="pSize">Size</label><input id="pSize" type="number" min="4" max="400" step="0.5" value="${o.size}" data-prop="size" data-num>
       <span class="seg"><button data-toggle="bold" class="${o.bold ? 'on' : ''}" title="Bold"><b>B</b></button><button data-toggle="italic" class="${o.italic ? 'on' : ''}" title="Italic"><i>I</i></button><button data-toggle="underline" class="${o.underline ? 'on' : ''}" title="Underline"><u>U</u></button></span></div>
       <div class="p-row"><label>Align</label><span class="seg">${['left', 'center', 'right'].map((a) => `<button data-set="align" data-val="${a}" class="${o.align === a ? 'on' : ''}">${a[0].toUpperCase() + a.slice(1)}</button>`).join('')}</span></div>
@@ -2042,6 +2135,22 @@ $('#props').addEventListener('click', (e) => {
   if (act === 'revert' && f) { f.pg.objects = f.pg.objects.filter((x) => x !== f.o); S.sel = null; commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); toast('Original text restored'); }
   if ((act === 'tl-align' || act === 'tl-reset') && f) alignTline(f.pg, f.o, act === 'tl-reset' ? null : b.dataset.val);
   if (act === 'font-upload') $('#fileFont').click();
+  if (act === 'copy') copySelected(false);
+  if (act === 'tl-font' && f) {
+    getModel(f.pg).then((m) => {
+      const ln = m.lines[f.o.key];
+      if (!ln) return;
+      const { D, ...st } = lineStyle(f.pg, m, ln.units);
+      Object.assign(S.defaults.text, st, { match: false });
+      toast(`New text will use ${docFont(st)?.psName || st.font} ${st.size}pt`);
+    });
+  }
+  if (act === 'match-near' && f?.o.type === 'text') {
+    nearbyStyle(f.pg, { x: f.o.x, y: f.o.y + f.o.size * 0.6 }).then((m) => {
+      if (!m) { toast('No document text nearby'); return; }
+      delete m.D; Object.assign(f.o, m); commit(); renderLayer(f.pg); renderProps();
+    });
+  }
   if ((act === 'del-line' || act === 'del-same') && f) deleteLineText(f.pg, f.o.key, act === 'del-same');
   if (act === 'restore-deleted') {
     S.pages.forEach((pg) => {
@@ -2100,12 +2209,49 @@ $('#fileFont').addEventListener('change', async (e) => {
 
 /* ================================================================ OBJECT OPS */
 function deleteSelected() {
-  const f = S.sel && findObj(S.sel);
-  if (!f) return;
-  if (f.o.type === 'tline') { deleteLineText(f.pg, f.o.key, false); return; }
-  f.pg.objects = f.pg.objects.filter((x) => x !== f.o);
-  S.sel = null;
-  commit(); renderLayer(f.pg); renderProps();
+  const ids = selIds();
+  if (!ids.length) return;
+  if (ids.length === 1) { const f = findObj(ids[0]); if (f?.o.type === 'tline') { deleteLineText(f.pg, f.o.key, false); return; } }
+  endEdit();
+  const pages = new Set(), text = new Set();
+  for (const id of ids) {
+    const f = findObj(id);
+    if (!f) continue;
+    pages.add(f.pg);
+    if (f.o.type === 'tline') { f.o.text = ''; text.add(f.pg); } else f.pg.objects = f.pg.objects.filter((x) => x !== f.o);
+  }
+  S.sel = null; S.multi = [];
+  commit();
+  for (const p of pages) { renderLayer(p); if (text.has(p)) { refreshCanvas(p); renderHits(p); } }
+  renderProps();
+  if (ids.length > 1) toast(`Deleted ${ids.length} items · Ctrl+Z to undo`);
+}
+// Copy the selection as it looks: existing text becomes a text box in the document's own font.
+async function copySelected(cut) {
+  const out = [];
+  for (const id of selIds()) {
+    const f = findObj(id);
+    if (!f) continue;
+    if (f.o.type !== 'tline') { out.push(JSON.parse(JSON.stringify(f.o))); continue; }
+    const t = await tlineToText(f.pg, f.o);
+    if (t) out.push(t);
+  }
+  if (!out.length) return;
+  S.clip = out;
+  if (cut) deleteSelected(); else toast(out.length > 1 ? `Copied ${out.length} items` : 'Copied', 1400);
+}
+async function tlineToText(pg, o) {
+  const model = await getModel(pg);
+  const line = model.lines[o.key];
+  if (!line || !o.text.trim()) return null;
+  const units = layoutEdit(pg, model, line, o);
+  if (!units.some((u) => u.t.trim())) return null;
+  const { D, ...st } = lineStyle(pg, model, units);
+  const t = { ...S.defaults.text, id: uid(), type: 'text', text: o.text, ...st, underline: false, align: 'left', opacity: 1 };
+  delete t.match;
+  t.x = round(D[4], 2);
+  t.y = round(D[5] - baselineRatio(textCss(t), docFont(t) ? null : { bold: t.bold, italic: t.italic }) * t.size, 2);
+  return t;
 }
 // Remove a line of existing text from the page; with `matching`, every identical line in the document.
 async function deleteLineText(pg, key, matching) {
@@ -2117,9 +2263,9 @@ async function deleteLineText(pg, key, matching) {
     if (p.blank) continue;
     const edits = new Map(p.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o]));
     for (const ln of (await getModel(p)).lines) {
-      if (!ln.editable || (matching ? ln.text !== text : p !== pg || ln.key !== key)) continue;
+      if (!ln.deletable || (matching ? ln.text !== text : p !== pg || ln.key !== key)) continue;
       let o = edits.get(ln.key);
-      if (!o) { o = { id: uid(), type: 'tline', key: ln.key, text: ln.text, bg: '#ffffff' }; p.objects.unshift(o); }
+      if (!o) { o = { id: uid(), type: 'tline', key: ln.key, text: ln.text, base: ln.text, bg: '#ffffff' }; p.objects.unshift(o); }
       if (o.text) { o.text = ''; touched.add(p); }
     }
   }
@@ -2144,11 +2290,11 @@ function duplicateSelected() {
 }
 function currentPage() { return S.pages[currentPageIndex()]; }
 function paste() {
-  if (!S.clip) return;
+  if (!S.clip?.length) return;
   const pg = currentPage();
-  const c = cloneObj(S.clip, 12);
-  S.clip = JSON.parse(JSON.stringify(c));
-  pg.objects.push(c); S.sel = c.id; commit(); renderLayer(pg); renderProps();
+  const cs = S.clip.map((o) => cloneObj(o, 12));
+  S.clip = JSON.parse(JSON.stringify(cs));
+  pg.objects.push(...cs); commit(); setSel(cs.map((c) => c.id));
 }
 
 /* ---- images & signatures ---- */
@@ -2855,6 +3001,44 @@ async function textFont(doc, cache, o) {
   const k = stdKey({ family: STD_FONTS[o.font] ? o.font : 'Helvetica', bold: o.bold, italic: o.italic });
   return outFont(doc, cache, 'std:' + k, async () => ({ font: await doc.embedFont(StandardFonts[k]), kind: 'std' })).then((x) => x.font);
 }
+// one line of a text box as [font, text] runs: a document font supplies what it embeds, its fallback the rest
+async function textRuns(doc, cache, o, line, stats) {
+  const info = docFont(o);
+  if (!info) { const font = await textFont(doc, cache, o); return [{ font, text: encodable(font, line, stats) }]; }
+  const emb = await embedFor(doc, cache, info);
+  const fb = (await embedFallback(doc, cache, fallbackFor(info))).font;
+  const runs = [];
+  for (const ch of line) {
+    const font = emb?.font && fontHas(info, ch) ? emb.font : fb;
+    const t = font === fb ? encodable(fb, ch, stats) : ch;
+    const last = runs[runs.length - 1];
+    if (last && last.font === font) last.text += t; else runs.push({ font, text: t });
+  }
+  return runs;
+}
+// font, size and colour of a run of existing text, in the form a text box uses
+function lineStyle(pg, model, units) {
+  const ref = units.find((u) => !u.syn && u.t.trim()) || units[0];
+  const st = model.styles[ref.si], info = RT.fonts.get(st.font);
+  const D = mul(viewportFor(pg, 1), ref.M);
+  return {
+    font: info?.css ? 'pdf:' + st.font : info?.style.family || 'Helvetica', size: round(Math.hypot(D[2], D[3]), 1), color: st.fill,
+    bold: !info?.css && !!info?.style.bold, italic: !info?.css && !!info?.style.italic, D,
+  };
+}
+// style of the existing text closest to a point (new text adopts it)
+async function nearbyStyle(pg, p) {
+  if (pg.blank) return null;
+  const model = await getModel(pg), vp = viewportFor(pg, 1);
+  let best = null, bd = Infinity;
+  for (const ln of model.lines) {
+    if (!ln.editable) continue;
+    const b = unitsBBox(model, ln.units, vp);
+    const d = Math.hypot(Math.max(b.x - p.x, 0, p.x - b.x - b.w), 2 * Math.max(b.y - p.y, 0, p.y - b.y - b.h));
+    if (d < bd) { bd = d; best = ln; }
+  }
+  return best && bd < 250 ? lineStyle(pg, model, best.units) : null;
+}
 function encodable(font, s, stats) {
   let out = '';
   for (const ch of s) { try { font.encodeText(ch); out += ch; } catch { out += '?'; stats.replaced++; } }
@@ -2865,17 +3049,21 @@ async function drawObj(doc, page, pg, o, cache, stats) {
   const rot = degrees(R(pg));
   const op = o.opacity ?? 1;
   if (o.type === 'text') {
-    const font = await textFont(doc, cache, o);
-    const lines = o.text.split('\n').map((l) => encodable(font, l, stats));
-    const widths = lines.map((l) => font.widthOfTextAtSize(l, o.size));
+    const lines = [];
+    for (const l of o.text.split('\n')) lines.push(await textRuns(doc, cache, o, l, stats));
+    const widths = lines.map((rs) => rs.reduce((a, r) => a + r.font.widthOfTextAtSize(r.text, o.size), 0));
     const boxW = Math.max(0, ...widths);
     const fam = textCss(o);
-    const bl = baselineRatio(fam, RT.customFonts.has(o.font) ? null : { bold: o.bold, italic: o.italic });
-    lines.forEach((l, i) => {
+    const bl = baselineRatio(fam, RT.customFonts.has(o.font) || docFont(o)?.css ? null : { bold: o.bold, italic: o.italic });
+    lines.forEach((rs, i) => {
       const dx = o.align === 'center' ? (boxW - widths[i]) / 2 : o.align === 'right' ? boxW - widths[i] : 0;
       const by = o.y + bl * o.size + i * LINE_H * o.size;
-      if (l) { const p = map(o.x + dx, by); page.drawText(l, { x: p.x, y: p.y, size: o.size, font, color: pdfColor(o.color), opacity: op, rotate: rot }); }
-      if (o.underline && l) {
+      let x = o.x + dx;
+      for (const r of rs) {
+        if (r.text) { const p = map(x, by); page.drawText(r.text, { x: p.x, y: p.y, size: o.size, font: r.font, color: pdfColor(o.color), opacity: op, rotate: rot }); }
+        x += r.font.widthOfTextAtSize(r.text, o.size);
+      }
+      if (o.underline && widths[i]) {
         const a = map(o.x + dx, by + o.size * 0.12), b = map(o.x + dx + widths[i], by + o.size * 0.12);
         page.drawLine({ start: a, end: b, thickness: Math.max(0.5, o.size * 0.06), color: pdfColor(o.color), opacity: op });
       }
@@ -3151,20 +3339,23 @@ document.addEventListener('keydown', (e) => {
   if (mod && k === '-') { e.preventDefault(); zoomStep(-1); return; }
   if (mod && k === '0') { e.preventDefault(); setZoom(1); return; }
   if (mod && k === 'd') { e.preventDefault(); duplicateSelected(); return; }
-  if (mod && k === 'c') { const f = S.sel && findObj(S.sel); if (f && f.o.type !== 'tline') S.clip = JSON.parse(JSON.stringify(f.o)); return; }
-  if (mod && k === 'x') { const f = S.sel && findObj(S.sel); if (f && f.o.type !== 'tline') { S.clip = JSON.parse(JSON.stringify(f.o)); deleteSelected(); } return; }
+  if (mod && (k === 'c' || k === 'x')) { if (selIds().length) { e.preventDefault(); copySelected(k === 'x'); } return; }
+  if (mod && k === 'a') { const pg = currentPage(); if (pg) { e.preventDefault(); const [W, H] = dispSize(pg); marqueeSelect(pg, { x: 0, y: 0, w: W, h: H }, false); } return; }
   if (e.key === 'Delete' || e.key === 'Backspace') { if (S.sel) { e.preventDefault(); deleteSelected(); } return; }
   if (e.key === 'Escape') { if (!$('#findbar').hidden) closeFind(); else if (S.sel) select(null); else setTool('select'); return; }
   if (e.key === 'Enter' && S.sel) { const f = findObj(S.sel); if (f?.o.type === 'text') editTextObj(f.pg, f.o, null); else if (f?.o.type === 'tline') editLine(f.pg, f.o.key, null); return; }
   if (e.key.startsWith('Arrow') && S.sel) {
-    const f = findObj(S.sel);
-    if (!f) return;
     e.preventDefault();
     const s = e.shiftKey ? 10 : 1;
     const dx = e.key === 'ArrowLeft' ? -s : e.key === 'ArrowRight' ? s : 0, dy = e.key === 'ArrowUp' ? -s : e.key === 'ArrowDown' ? s : 0;
-    if (f.o.type === 'tline') { moveTline(f.pg, f.o, f.o.off, dx, dy); commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); return; }
-    translateObj(f.o, JSON.parse(JSON.stringify(f.o)), dx, dy);
-    commit(); renderLayer(f.pg); renderProps();
+    const pages = new Set(), text = new Set();
+    for (const f of selIds().map(findObj).filter(Boolean)) {
+      pages.add(f.pg);
+      if (f.o.type === 'tline') { moveTline(f.pg, f.o, f.o.off, dx, dy); text.add(f.pg); } else translateObj(f.o, JSON.parse(JSON.stringify(f.o)), dx, dy);
+    }
+    commit();
+    for (const p of pages) { renderLayer(p); if (text.has(p)) { refreshCanvas(p); renderHits(p); } }
+    renderProps();
     return;
   }
   if (!mod && !e.altKey && TOOL_KEYS[k]) { setTool(TOOL_KEYS[k]); }
