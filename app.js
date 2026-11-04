@@ -570,6 +570,58 @@ function layoutLine(model, line, text) {
   return out;
 }
 
+/* ---- an edited line as placed: line breaks, alignment against the original line, and any move ---- */
+const tlineMoved = (o) => !!(o.off && (o.off[0] || o.off[1]));
+const tlineChanged = (o, line) => o.text !== line.text || tlineMoved(o) || (!!o.align && o.align !== 'left');
+function layoutEdit(pg, model, line, o) {
+  if (!o.text.includes('\n') && !tlineMoved(o) && (!o.align || o.align === 'left')) return layoutLine(model, line, o.text);
+  const ref = line.units.find((u) => !u.syn) || line.units[0];
+  const M = ref.M, al = Math.hypot(M[0], M[1]) || 1, dir = [M[0] / al, M[1] / al];
+  // extent of the inked characters along the baseline (user space)
+  const span = (units) => {
+    let a = Infinity, b = -Infinity;
+    for (const u of units) {
+      if (!u.t.trim()) continue;
+      const s = u.M[4] * dir[0] + u.M[5] * dir[1];
+      a = Math.min(a, s); b = Math.max(b, s + u.adv * Math.hypot(u.M[0], u.M[1]));
+    }
+    return a <= b ? [a, b] : null;
+  };
+  const [a0, b0] = span(line.units) || [0, 0];
+  let mid = (a0 + b0) / 2;
+  if (o.align === 'page') {
+    const vp = viewportFor(pg, 1), [W] = dispSize(pg);
+    const k = vp[0] * dir[0] + vp[2] * dir[1]; // display x per user unit along the baseline
+    if (Math.abs(k) > 1e-6) mid = M[4] * dir[0] + M[5] * dir[1] + (W / 2 - apply(vp, M[4], M[5])[0]) / k;
+  }
+  const off = o.off || [0, 0];
+  const out = [];
+  o.text.split('\n').forEach((part, i) => {
+    const units = layoutLine(model, line, part);
+    const sp = span(units);
+    let shift = 0;
+    if (sp && o.align === 'right') shift = b0 - sp[1];
+    else if (sp && (o.align === 'center' || o.align === 'page')) shift = mid - (sp[0] + sp[1]) / 2;
+    const tx = shift * dir[0] - i * LINE_H * M[2] + off[0], ty = shift * dir[1] - i * LINE_H * M[3] + off[1];
+    for (const u of units) out.push({ ...u, M: [u.M[0], u.M[1], u.M[2], u.M[3], u.M[4] + tx, u.M[5] + ty] });
+  });
+  return out;
+}
+function tlineAt(pg, model, key) {
+  let o = tlineFor(pg, key);
+  if (!o) {
+    const line = model.lines[key];
+    o = { id: uid(), type: 'tline', key, text: line.text, bg: sampleBg(pg, unitsBBox(model, line.units, viewportFor(pg, 1))) };
+    pg.objects.unshift(o);
+  }
+  return o;
+}
+// move an edited line by a display-space delta (stored in user space, so it survives page rotation)
+function moveTline(pg, o, base, dx, dy) {
+  const iv = invertM(viewportFor(pg, 1)), b = base || [0, 0];
+  o.off = [round(b[0] + iv[0] * dx + iv[2] * dy, 3), round(b[1] + iv[1] * dx + iv[3] * dy, 3)];
+}
+
 function unitsBBox(model, units, vp) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const u of units) {
@@ -585,7 +637,7 @@ function unitsBBox(model, units, vp) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 function tlineFor(pg, key) { return pg.objects.find((o) => o.type === 'tline' && o.key === key); }
-const tlineSig = (pg) => JSON.stringify([pg.src, pg.index, ...pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o.text, o.bg])]);
+const tlineSig = (pg) => JSON.stringify([pg.src, pg.index, ...pg.objects.filter((o) => o.type === 'tline').map((o) => [o.key, o.text, o.bg, o.off, o.align])]);
 
 /* ================================================================ CONTENT STREAM SURGERY */
 function contentBytes(page) {
@@ -984,7 +1036,7 @@ async function applyTextEdits(doc, page, pg, cache, stats) {
   const edits = pg.objects.filter((o) => o.type === 'tline');
   if (!edits.length) return;
   const model = await getModel(pg);
-  const edited = edits.map((e) => ({ e, line: model.lines[e.key] })).filter((x) => x.line && x.e.text !== x.line.text);
+  const edited = edits.map((e) => ({ e, line: model.lines[e.key] })).filter((x) => x.line && tlineChanged(x.e, x.line));
   if (!edited.length) return;
   const removeSet = new Set();
   const coverLines = [];
@@ -1019,7 +1071,7 @@ async function applyTextEdits(doc, page, pg, cache, stats) {
     });
     if (keep.length) await drawUnits(doc, page, model, keep, cache, null);
   }
-  for (const { line, e } of edited) await drawUnits(doc, page, model, layoutLine(model, line, e.text), cache, stats);
+  for (const { line, e } of edited) await drawUnits(doc, page, model, layoutEdit(pg, model, line, e), cache, stats);
 }
 function invertM(m) {
   const d = m[0] * m[3] - m[1] * m[2];
@@ -1154,7 +1206,7 @@ async function renderHits(pg) {
     if (!ln.editable) continue;
     const t = edits.get(ln.key);
     if (t && !t.text.trim()) continue; // deleted text is gone, not an empty field
-    const units = t ? layoutLine(model, ln, t.text) : ln.units;
+    const units = t ? layoutEdit(pg, model, ln, t) : ln.units;
     const ref = ln.units.find((u) => !u.syn) || ln.units[0];
     if (!isHorizontalInDisplay(pg, ref.M)) continue;
     const bb = unitsBBox(model, units.length ? units : ln.units, vp);
@@ -1261,19 +1313,22 @@ async function renderLayer(pg) {
   if (tlines.length) {
     const vp = viewportFor(pg, 1);
     const stale = el._renderedSig !== tlineSig(pg);
+    const drawn = el._tlDrawn || (el._tlDrawn = new Map()); // where the canvas currently shows each edit
     for (const o of tlines) {
       const line = model.lines[o.key];
       if (!line || (!o.text.trim() && S.editing !== o.id)) continue;
-      const units = layoutLine(model, line, o.text);
+      const units = layoutEdit(pg, model, line, o);
       const bb = unitsBBox(model, units.length ? units : line.units, vp);
       const obb = unitsBBox(model, line.units, vp);
-      if ((stale || S.editing === o.id) && S.editing !== o.id) {
-        const c = document.createElement('div'); c.className = 'cover';
-        const u = union(bb, obb);
-        Object.assign(c.style, { left: (u.x - 0.8) * z + 'px', top: (u.y - 0.8) * z + 'px', width: (u.w + 1.6) * z + 'px', height: (u.h + 1.6) * z + 'px', background: o.bg || '#fff' });
-        layer.appendChild(c);
-        layer.appendChild(ghostText(pg, model, line, o.text));
-      }
+      if (stale && S.editing !== o.id) {
+        for (const u of [obb, bb, drawn.get(o.id)]) {
+          if (!u) continue;
+          const c = document.createElement('div'); c.className = 'cover';
+          Object.assign(c.style, { left: (u.x - 0.8) * z + 'px', top: (u.y - 0.8) * z + 'px', width: (u.w + 1.6) * z + 'px', height: (u.h + 1.6) * z + 'px', background: o.bg || '#fff' });
+          layer.appendChild(c);
+        }
+        layer.appendChild(ghostText(pg, model, line, o));
+      } else if (!stale) drawn.set(o.id, bb);
       const h = makeObjEl(o, pg);
       Object.assign(h.style, { left: bb.x * z + 'px', top: bb.y * z + 'px', width: Math.max(bb.w, 2) * z + 'px', height: bb.h * z + 'px' });
       layer.appendChild(h);
@@ -1293,13 +1348,13 @@ async function renderLayer(pg) {
 const union = (a, b) => { const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y); return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y }; };
 
 // Static HTML rendering of an edited line in the real font (used while the canvas preview rebuilds)
-function ghostText(pg, model, line, text) {
+function ghostText(pg, model, line, o) {
   const z = S.zoom;
   const vp = viewportFor(pg, 1);
   const wrap = document.createElement('div');
   wrap.className = 'ghost';
   wrap.style.cssText = 'position:absolute;inset:0;pointer-events:none';
-  for (const u of layoutLine(model, line, text)) {
+  for (const u of layoutEdit(pg, model, line, o)) {
     if (u.syn || u.t === ' ') continue;
     const st = model.styles[u.si];
     const info = RT.fonts.get(st.font);
@@ -1413,12 +1468,8 @@ async function editLine(pg, key, ev) {
   const line = model.lines[key];
   if (!line?.editable) return;
   endEdit();
-  let o = tlineFor(pg, key);
+  const o = tlineAt(pg, model, key);
   const vp = viewportFor(pg, 1);
-  if (!o) {
-    o = { id: uid(), type: 'tline', key, text: line.text, bg: sampleBg(pg, unitsBBox(model, line.units, vp)) };
-    pg.objects.unshift(o);
-  }
   S.sel = o.id;
   const before = o.text;
   await renderLayer(pg);
@@ -1439,12 +1490,24 @@ async function editLine(pg, key, ev) {
   const F = mul(vp, first.M);
   const z = S.zoom;
   const toDisp = size / (st.Tfs || 1);
-  const bbOld = union(unitsBBox(model, line.units, vp), unitsBBox(model, layoutLine(model, line, o.text), vp));
-  const cover = document.createElement('div');
-  cover.className = 'cover';
+  const obb = unitsBBox(model, line.units, vp);
+  const cur = layoutEdit(pg, model, line, o);
+  const bbCur = cur.length ? unitsBBox(model, cur, vp) : obb;
+  const covers = [obb, bbCur, null].map(() => { const c = document.createElement('div'); c.className = 'cover'; return c; });
+  const off = o.off || [0, 0];
+  const offD = [vp[0] * off[0] + vp[2] * off[1], vp[1] * off[0] + vp[3] * off[1]];
+  const [W] = dispSize(pg);
   const place = () => {
-    const w = Math.max(bbOld.w, ed.offsetWidth * sx / z);
-    Object.assign(cover.style, { left: (bbOld.x - 0.8) * z + 'px', top: (bbOld.y - 0.8) * z + 'px', width: (w + 1.6) * z + 'px', height: (bbOld.h + 1.6) * z + 'px', background: o.bg });
+    // the editor sits where the text will be laid out: aligned on the original line (or page), then moved
+    const w = ed.offsetWidth * sx / z, h = ed.offsetHeight / z;
+    let x = F[4];
+    if (o.align === 'center') x = obb.x + obb.w / 2 - w / 2;
+    else if (o.align === 'right') x = obb.x + obb.w - w;
+    else if (o.align === 'page') x = W / 2 - w / 2;
+    x += offD[0];
+    const y = F[5] - bl * size + offD[1];
+    Object.assign(ed.style, { left: x * z + 'px', top: y * z + 'px', textAlign: o.align === 'page' ? 'center' : o.align || 'left' });
+    [obb, bbCur, { x, y, w, h }].forEach((r, i) => Object.assign(covers[i].style, { left: (r.x - 0.8) * z + 'px', top: (r.y - 0.8) * z + 'px', width: (r.w + 1.6) * z + 'px', height: (r.h + 1.6) * z + 'px', background: o.bg }));
   };
   const ed = document.createElement('div');
   ed.className = 'obj text editing';
@@ -1454,22 +1517,23 @@ async function editLine(pg, key, ev) {
     `letter-spacing:${st.Tc * toDisp * z}px;word-spacing:${st.Tw * toDisp * z}px;transform:scaleX(${sx});transform-origin:0 0;` +
     (info?.css ? '' : `font-weight:${fb.std.bold ? 700 : 400};font-style:${fb.std.italic ? 'italic' : 'normal'};`);
   layer.querySelectorAll('.ghost, .cover').forEach((n) => n.remove());
-  layer.append(cover, ed);
+  layer.append(...covers, ed);
   place();
   try { ed.contentEditable = 'plaintext-only'; } catch { ed.contentEditable = 'true'; }
   if (ed.contentEditable !== 'plaintext-only') ed.contentEditable = 'true';
   ed.focus();
   placeCaret(ed, ev);
   const warn = () => renderProps();
-  ed.addEventListener('input', () => { place(); o.text = ed.textContent.replace(/\n/g, ' '); warn(); });
+  ed.addEventListener('input', () => { place(); o.text = editorText(ed); warn(); });
   ed.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); S.editFinish?.(); }
+    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); document.execCommand('insertLineBreak'); }
+    else if (e.key === 'Enter') { e.preventDefault(); S.editFinish?.(); }
     if (e.key === 'Escape') { e.preventDefault(); ed.textContent = before; S.editFinish?.(); }
     e.stopPropagation();
   });
   ed.addEventListener('paste', (e) => {
     e.preventDefault();
-    const t = (e.clipboardData.getData('text/plain') || '').replace(/[\r\n]+/g, ' ');
+    const t = (e.clipboardData.getData('text/plain') || '').replace(/\r\n?/g, '\n');
     document.execCommand('insertText', false, t);
   });
   let done = false;
@@ -1484,11 +1548,12 @@ function placeCaret(el, ev) {
   if (!range || !el.contains(range.startContainer)) { range = document.createRange(); range.selectNodeContents(el); range.collapse(false); }
   sel.removeAllRanges(); sel.addRange(range);
 }
+const editorText = (ed) => ed.innerText.replace(/\r/g, '').replace(/\n+$/, '');
 function finishLineEdit(pg, o, line, ed) {
-  o.text = ed.textContent.replace(/\n/g, ' ');
+  o.text = editorText(ed);
   if (!o.text.trim()) o.text = '';
   S.editing = null;
-  if (o.text === line.text) pg.objects = pg.objects.filter((x) => x !== o);
+  if (!tlineChanged(o, line)) pg.objects = pg.objects.filter((x) => x !== o);
   if (S.sel === o.id && (!o.text || !pg.objects.includes(o))) S.sel = null;
   commit();
   renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
@@ -1546,16 +1611,22 @@ $('#pages').addEventListener('pointerdown', async (e) => {
     return;
   }
   // edit existing text
+  // existing text with the edit tool: click to edit, drag to move the line
   const hit = e.target.closest('.hit');
-  if (tool === 'edit' && hit) { e.preventDefault(); editLine(pg, +hit.dataset.key, e); return; }
+  const tl = oid && findObj(oid)?.o;
+  if (tool === 'edit' && (hit || tl?.type === 'tline')) {
+    e.preventDefault(); endEdit();
+    const d = { kind: 'tpress', pg, key: tl?.type === 'tline' ? tl.key : +hit.dataset.key, start: p, el, model: null };
+    drag = d;
+    getModel(pg).then((m) => { d.model = m; });
+    el.setPointerCapture(e.pointerId);
+    return;
+  }
 
   if (oid && ['select', 'edit', 'text'].includes(tool)) {
     const f = findObj(oid);
     if (!f) return;
-    if (f.o.type === 'tline') {
-      if (tool !== 'select' || e.detail >= 2) { e.preventDefault(); editLine(pg, f.o.key, e); return; }
-      e.preventDefault(); endEdit(); select(oid); return;
-    }
+    if (f.o.type === 'tline' && (tool !== 'select' || e.detail >= 2)) { e.preventDefault(); editLine(pg, f.o.key, e); return; }
     if (f.o.type === 'text' && (tool === 'text' || e.detail >= 2)) { e.preventDefault(); editTextObj(pg, f.o, e); return; }
     e.preventDefault(); endEdit();
     if (S.sel !== oid) select(oid);
@@ -1611,11 +1682,19 @@ $('#pages').addEventListener('pointermove', (e) => {
   const p = ptIn(drag.el, e);
   const { pg, o } = drag;
   if (drag.kind === 'cut') { if (Math.abs(p.y - drag.start.y) > 3) showBand(drag.el, Math.min(p.y, drag.start.y), Math.max(p.y, drag.start.y)); return; }
+  if (drag.kind === 'tpress') {
+    if (!drag.model || Math.hypot(p.x - drag.start.x, p.y - drag.start.y) * S.zoom < 4) return;
+    const t = tlineAt(pg, drag.model, drag.key);
+    S.sel = t.id;
+    drag = { kind: 'move', pg, o: t, start: drag.start, orig: JSON.parse(JSON.stringify(t)), el: drag.el, moved: true };
+    renderProps();
+  }
   if (drag.kind === 'move') {
+    const { o } = drag;
     let dx = p.x - drag.start.x, dy = p.y - drag.start.y;
     if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
     if (Math.abs(dx) + Math.abs(dy) > 0.5) drag.moved = true;
-    if (o.type === 'tline') return;
+    if (o.type === 'tline') { moveTline(pg, o, drag.orig.off, dx, dy); schedule(() => renderLayer(pg)); return; }
     translateObj(o, drag.orig, dx, dy);
     schedule(() => renderLayer(pg));
   } else if (drag.kind === 'resize') {
@@ -1640,6 +1719,12 @@ $('#pages').addEventListener('pointerup', async (e) => {
   if (!drag) return;
   const d = drag; drag = null;
   const { pg } = d;
+  if (d.kind === 'tpress') { editLine(pg, d.key, e); return; }
+  if (d.kind === 'move' && d.o.type === 'tline') {
+    commit(); renderLayer(pg); renderProps();
+    if (d.moved) { refreshCanvas(pg); renderHits(pg); }
+    return;
+  }
   if (d.kind === 'cut') {
     const p = ptIn(d.el, e);
     const band = Math.abs(p.y - d.start.y) > 3 ? { a: Math.min(p.y, d.start.y), b: Math.max(p.y, d.start.y) } : pg.blank ? null : detectBand(await getGeom(pg), p);
@@ -1752,7 +1837,7 @@ async function textAwareBoxes(pg, r, click) {
 /* ================================================================ TOOLS */
 const HINTS = {
   select: 'Select, move and resize. Double-click text to edit. Delete removes; arrows nudge (Shift = 10pt).',
-  edit: 'Click any line of existing text to edit it in its original font, size and colour. Enter to finish, Esc to cancel.',
+  edit: 'Click any line of existing text to edit it in its original font, size and colour; drag it to move. Enter to finish, Shift+Enter for a new line, Esc to cancel.',
   text: 'Click to add a text box. Shift+Enter for a new line while typing.',
   whiteout: 'Drag to cover an area with a solid box.',
   cut: 'Click a table row or a line to delete it and close the gap. Drag to mark any strip. Ctrl+Z brings it back.',
@@ -1818,8 +1903,13 @@ function docProps() {
 }
 function tlineProps(pg, o) {
   return `<div class="p-sec"><h3 class="p-title">Edited text</h3>
-    <p class="p-note">Saved in the document's own font, size and colour at the original position. Characters you didn't change keep their exact placement.</p>
+    <p class="p-note">Saved in the document's own font, size and colour. Characters you didn't change keep their exact placement. Shift+Enter starts a new line.</p>
     <div id="tlInfo" class="p-note">Reading font…</div></div>
+    <div class="p-sec"><h3 class="p-title">Position</h3>
+      <div class="p-row"><label>Align</label><span class="seg">${[['left', 'Left'], ['center', 'Center'], ['right', 'Right']].map(([a, l]) => `<button data-act="tl-align" data-val="${a}" class="${(o.align || 'left') === a ? 'on' : ''}" title="${l} on the original line">${l}</button>`).join('')}</span></div>
+      <div class="p-actions" style="margin-top:6px"><button class="btn small ${o.align === 'page' ? 'on' : ''}" data-act="tl-align" data-val="page">Center on page</button>
+      ${tlineMoved(o) ? '<button class="btn small" data-act="tl-reset">Reset position</button>' : ''}</div>
+      <p class="p-note" style="margin-top:6px">Drag the text to move it; arrow keys nudge (Shift = 10pt).</p></div>
     <div class="p-sec"><div class="p-actions">
       <button class="btn small" data-act="edit-tline">Edit text</button>
       <button class="btn small" data-act="revert">Revert to original</button></div></div>
@@ -1841,7 +1931,7 @@ async function fillTlineInfo(pg, o) {
   const st = model.styles[ref.si];
   const info = RT.fonts.get(st.font);
   const size = Math.hypot(ref.M[2], ref.M[3]);
-  const missing = info?.std14 ? [] : [...new Set([...o.text].filter((c) => c !== ' ' && !fontHas(info, c) && !line.text.includes(c)))];
+  const missing = info?.std14 ? [] : [...new Set([...o.text].filter((c) => c !== ' ' && c !== '\n' && !fontHas(info, c) && !line.text.includes(c)))];
   const fb = fallbackFor(info || { style: { family: 'Helvetica' } });
   let h = `<b>Font</b> ${esc(info?.psName || 'Unknown')}${info?.embedded ? ' (embedded)' : ''}<br><b>Size</b> ${round(size, 2)} pt &nbsp; <b>Colour</b> <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${st.fill};vertical-align:-1px;box-shadow:0 0 0 1px var(--line-strong)"></span> ${st.fill}`;
   if (missing.length) {
@@ -1950,6 +2040,7 @@ $('#props').addEventListener('click', (e) => {
   if (act === 'edit-text' && f) editTextObj(f.pg, f.o, null);
   if (act === 'edit-tline' && f) editLine(f.pg, f.o.key, null);
   if (act === 'revert' && f) { f.pg.objects = f.pg.objects.filter((x) => x !== f.o); S.sel = null; commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); toast('Original text restored'); }
+  if ((act === 'tl-align' || act === 'tl-reset') && f) alignTline(f.pg, f.o, act === 'tl-reset' ? null : b.dataset.val);
   if (act === 'font-upload') $('#fileFont').click();
   if ((act === 'del-line' || act === 'del-same') && f) deleteLineText(f.pg, f.o.key, act === 'del-same');
   if (act === 'restore-deleted') {
@@ -1962,7 +2053,28 @@ $('#props').addEventListener('click', (e) => {
   }
 });
 // keep the line editor open while its Delete buttons are pressed, so the click still knows the line
-$('#props').addEventListener('mousedown', (e) => { if (S.editing && e.target.closest('[data-act^="del-"]')) e.preventDefault(); });
+$('#props').addEventListener('mousedown', (e) => { if (S.editing && e.target.closest('[data-act^="del-"], [data-act^="tl-"]')) e.preventDefault(); });
+// Align an edited line on its original line (or the page). A manual move keeps only its off-baseline part;
+// `align` null resets the position entirely.
+async function alignTline(pg, o, align) {
+  endEdit();
+  const line = (await getModel(pg)).lines[o.key];
+  if (!line || !pg.objects.includes(o)) return;
+  if (align == null) { delete o.off; delete o.align; }
+  else {
+    o.align = align;
+    if (o.off) {
+      const ref = line.units.find((u) => !u.syn) || line.units[0];
+      const l = Math.hypot(ref.M[0], ref.M[1]) || 1, d = [ref.M[0] / l, ref.M[1] / l];
+      const k = o.off[0] * d[0] + o.off[1] * d[1];
+      o.off = [round(o.off[0] - k * d[0], 3), round(o.off[1] - k * d[1], 3)];
+      if (!tlineMoved(o)) delete o.off;
+    }
+  }
+  if (!tlineChanged(o, line)) { pg.objects = pg.objects.filter((x) => x !== o); S.sel = null; }
+  else S.sel = o.id;
+  commit(); renderLayer(pg); refreshCanvas(pg); renderHits(pg); renderProps();
+}
 
 /* ---- custom fonts ---- */
 $('#fileFont').addEventListener('change', async (e) => {
@@ -2635,7 +2747,7 @@ async function resultBox(r) {
   const model = await getModel(pg);
   const ln = model.lines[r.key];
   const t = tlineFor(pg, r.key);
-  const units = layoutLine(model, ln, t ? t.text : ln.text);
+  const units = t ? layoutEdit(pg, model, ln, t) : ln.units;
   let c = 0;
   const sel = units.filter((u) => { const s = c; c += u.t.length; return s < r.at + r.len && c > r.at; });
   return unitsBBox(model, sel.length ? sel : units, viewportFor(pg, 1));
@@ -2665,10 +2777,9 @@ async function replaceIn(r, rep) {
   if (r.kind === 'obj') { const f = findObj(r.oid); if (f) f.o.text = f.o.text.slice(0, r.at) + rep + f.o.text.slice(r.at + r.len); return pg; }
   const model = await getModel(pg);
   const ln = model.lines[r.key];
-  let t = tlineFor(pg, r.key);
-  if (!t) { t = { id: uid(), type: 'tline', key: r.key, text: ln.text, bg: sampleBg(pg, unitsBBox(model, ln.units, viewportFor(pg, 1))) }; pg.objects.unshift(t); }
+  const t = tlineAt(pg, model, r.key);
   t.text = t.text.slice(0, r.at) + rep + t.text.slice(r.at + r.len);
-  if (t.text === ln.text) pg.objects = pg.objects.filter((x) => x !== t);
+  if (!tlineChanged(t, ln)) pg.objects = pg.objects.filter((x) => x !== t);
   return pg;
 }
 $('#replaceOne').onclick = async () => {
@@ -3047,10 +3158,11 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && S.sel) { const f = findObj(S.sel); if (f?.o.type === 'text') editTextObj(f.pg, f.o, null); else if (f?.o.type === 'tline') editLine(f.pg, f.o.key, null); return; }
   if (e.key.startsWith('Arrow') && S.sel) {
     const f = findObj(S.sel);
-    if (!f || f.o.type === 'tline') return;
+    if (!f) return;
     e.preventDefault();
     const s = e.shiftKey ? 10 : 1;
     const dx = e.key === 'ArrowLeft' ? -s : e.key === 'ArrowRight' ? s : 0, dy = e.key === 'ArrowUp' ? -s : e.key === 'ArrowDown' ? s : 0;
+    if (f.o.type === 'tline') { moveTline(f.pg, f.o, f.o.off, dx, dy); commit(); renderLayer(f.pg); refreshCanvas(f.pg); renderHits(f.pg); renderProps(); return; }
     translateObj(f.o, JSON.parse(JSON.stringify(f.o)), dx, dy);
     commit(); renderLayer(f.pg); renderProps();
     return;
