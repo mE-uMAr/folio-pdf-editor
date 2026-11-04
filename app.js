@@ -1533,7 +1533,7 @@ async function renderLayer(pg) {
   const z = S.zoom;
   const tlines = pg.objects.filter((o) => o.type === 'tline');
   const model = tlines.length ? await getModel(pg) : null;
-  if (S.editing && pg.objects.some((o) => o.id === S.editing && o.type === 'tline')) return; // don't tear down a live editor
+  if (S.editing && pg.objects.some((o) => o.id === S.editing)) return; // don't tear down a live editor
   layer.innerHTML = '';
   // edited existing-text lines: ghost render until the canvas preview catches up
   if (tlines.length) {
@@ -1827,12 +1827,13 @@ function finishLineEdit(pg, o, line, ed) {
 function endEdit() { S.editFinish?.(); }
 
 /* ---- new text boxes ---- */
-function editTextObj(pg, o, ev) {
+async function editTextObj(pg, o, ev) {
   endEdit();
-  S.sel = o.id; S.editing = o.id;
-  renderLayer(pg);
-  const el = pageEl(pg.id).querySelector(`.obj.text[data-oid="${o.id}"]`);
-  if (!el) return;
+  S.sel = o.id; S.multi = [];
+  await renderLayer(pg); // async when the page has edited lines: the box must exist before it can be focused
+  S.editing = o.id;
+  const el = pageEl(pg.id)?.querySelector(`.obj.text[data-oid="${o.id}"]`);
+  if (!el) { S.editing = null; return; }
   el.classList.add('editing');
   try { el.contentEditable = 'plaintext-only'; } catch {}
   if (el.contentEditable !== 'plaintext-only') el.contentEditable = 'true';
