@@ -1469,6 +1469,7 @@ function styleTextEl(el, o) {
     left: o.x * z + 'px', top: o.y * z + 'px', fontSize: o.size * z + 'px', fontFamily: textCss(o),
     fontWeight: o.bold ? '700' : '400', fontStyle: o.italic ? 'italic' : 'normal', color: o.color, opacity: o.opacity,
     textDecoration: o.underline ? 'underline' : 'none', textAlign: o.align,
+    width: o.w ? o.w * z + 'px' : '', whiteSpace: o.w ? 'pre-wrap' : 'pre',
   });
 }
 function makeObjEl(o, pg) {
@@ -1618,7 +1619,7 @@ function baselineRatio(fam, std) {
 /* ---- selection ---- */
 function objBBox(o, pg) {
   switch (o.type) {
-    case 'text': return { x: o.x, y: o.y, w: o._w || 10, h: o._h || o.size * LINE_H };
+    case 'text': return { x: o.x, y: o.y, w: o.w || o._w || 10, h: o._h || o.size * LINE_H };
     case 'line': return { x: Math.min(o.x1, o.x2), y: Math.min(o.y1, o.y2), w: Math.abs(o.x2 - o.x1), h: Math.abs(o.y2 - o.y1) };
     case 'path': {
       const xs = o.points.map((p) => p[0]), ys = o.points.map((p) => p[1]);
@@ -1652,7 +1653,7 @@ function drawSelection(pg, o, layer, handles = true) {
     add('nw', x, y); add('n', x + w / 2, y); add('ne', x + w, y); add('e', x + w, y + h / 2);
     add('se', x + w, y + h); add('s', x + w / 2, y + h); add('sw', x, y + h); add('w', x, y + h / 2);
   } else if (o.type === 'line') { add('p1', o.x1, o.y1); add('p2', o.x2, o.y2); }
-  else if (o.type === 'text' && S.editing !== o.id) add('fs', bb.x + bb.w, bb.y + bb.h);
+  else if (o.type === 'text' && S.editing !== o.id) { add('fs', bb.x + bb.w, bb.y + bb.h); add('tw', bb.x + bb.w, bb.y + bb.h / 2); }
 }
 const selIds = () => (S.multi.length ? S.multi : S.sel ? [S.sel] : []);
 function layersOf(ids) { return new Set(ids.map(findObj).filter(Boolean).map((f) => f.pg)); }
@@ -1849,7 +1850,7 @@ async function editTextObj(pg, o, ev) {
     commit(); renderLayer(pg); renderProps();
   };
   el.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); S.editFinish?.(); } e.stopPropagation(); });
-  el.addEventListener('blur', () => S.editFinish?.());
+  el.addEventListener('blur', (e) => { if (!$('#props').contains(e.relatedTarget)) S.editFinish?.(); });
   renderProps();
 }
 
@@ -2096,6 +2097,7 @@ function resizeObj(o, orig, h, p, start, shift) {
   const dx = p.x - start.x, dy = p.y - start.y;
   if (h === 'p1') { o.x1 = p.x; o.y1 = p.y; return; }
   if (h === 'p2') { o.x2 = p.x; o.y2 = p.y; return; }
+  if (h === 'tw') { o.w = round(Math.max(o.size, (orig.w || orig._w || 10) + dx), 1); return; } // text box width (wraps)
   if (h === 'fs') { const w = orig._w || 10; o.size = clamp(round(orig.size * (w + dx) / w, 1), 4, 400); return; }
   let { x, y, w, h: hh } = orig;
   if (h.includes('w')) { x += dx; w -= dx; }
@@ -2273,7 +2275,7 @@ function objProps(o, isDefault) {
       ${isDefault ? `<label class="check"><input type="checkbox" data-check="match" ${o.match !== false ? 'checked' : ''}> Match the nearest document text (font, size, colour)</label>` : `<div class="p-actions"><button class="btn small" data-act="match-near">Match nearby text</button></div>`}
       <div class="p-row"><label for="pSize">Size</label><input id="pSize" type="number" min="4" max="400" step="0.5" value="${o.size}" data-prop="size" data-num>
       <span class="seg"><button data-toggle="bold" class="${o.bold ? 'on' : ''}" title="Bold"><b>B</b></button><button data-toggle="italic" class="${o.italic ? 'on' : ''}" title="Italic"><i>I</i></button><button data-toggle="underline" class="${o.underline ? 'on' : ''}" title="Underline"><u>U</u></button></span></div>
-      <div class="p-row"><label>Align</label><span class="seg">${['left', 'center', 'right'].map((a) => `<button data-set="align" data-val="${a}" class="${o.align === a ? 'on' : ''}">${a[0].toUpperCase() + a.slice(1)}</button>`).join('')}</span></div>
+      <div class="p-row"><label>Align</label><span class="seg">${['left', 'center', 'right', 'justify'].map((a) => `<button data-set="align" data-val="${a}" class="${o.align === a ? 'on' : ''}">${a[0].toUpperCase() + a.slice(1)}</button>`).join('')}</span></div>
       ${colorRow('Colour', 'color', o.color, false)}`;
   }
   if (o.type === 'box' || o.type === 'ellipse') {
@@ -2290,6 +2292,7 @@ function objProps(o, isDefault) {
     if (o.type !== 'path' && o.type !== 'line') {
       h += `<div class="p-sec"><h3 class="p-title">Position (pt)</h3><div class="p-grid">
         <label>X <input type="number" step="0.5" value="${round(bb.x, 1)}" data-geo="x"></label><label>Y <input type="number" step="0.5" value="${round(bb.y, 1)}" data-geo="y"></label>
+        ${o.type === 'text' ? `<label title="Set a width to wrap lines (needed for Justify)">W <input type="number" step="0.5" min="0" value="${o.w ? round(o.w, 1) : ''}" placeholder="auto" data-geo="w"></label>` : ''}
         ${o.type !== 'text' ? `<label>W <input type="number" step="0.5" value="${round(bb.w, 1)}" data-geo="w"></label><label>H <input type="number" step="0.5" value="${round(bb.h, 1)}" data-geo="h"></label>` : ''}</div></div>`;
     }
     h += `<div class="p-sec"><div class="p-actions">
@@ -2312,6 +2315,9 @@ function setProp(prop, val, final = true) {
   const f = S.sel && findObj(S.sel);
   if (f && f.o.type !== 'tline') {
     f.o[prop] = val;
+    // justified text needs a width to fill: start from the box as it is now
+    if (prop === 'align' && val === 'justify' && f.o.type === 'text' && !f.o.w) f.o.w = round(f.o._w || 120, 1);
+    if (S.editing === f.o.id) { const el = pageEl(f.pg.id)?.querySelector(`.obj.text[data-oid="${f.o.id}"]`); if (el) styleTextEl(el, f.o); }
     renderLayer(f.pg);
     if (final) { commit(); renderProps(); }
   } else if (S.defaults[S.tool]) {
@@ -2335,7 +2341,8 @@ $('#props').addEventListener('change', (e) => {
     const f = findObj(S.sel);
     if (!f) return;
     const o = f.o, v = +t.value;
-    if (o.type === 'text' && t.dataset.geo in { x: 1, y: 1 }) o[t.dataset.geo] = v;
+    if (o.type === 'text' && t.dataset.geo === 'w') { if (v > 0) o.w = Math.max(o.size, v); else delete o.w; }
+    else if (o.type === 'text' && t.dataset.geo in { x: 1, y: 1 }) o[t.dataset.geo] = v;
     else if ('x' in o) o[t.dataset.geo] = t.dataset.geo === 'w' || t.dataset.geo === 'h' ? Math.max(1, v) : v;
     commit(); renderLayer(f.pg);
   }
@@ -3238,6 +3245,23 @@ async function textFont(doc, cache, o) {
   const k = stdKey({ family: STD_FONTS[o.font] ? o.font : 'Helvetica', bold: o.bold, italic: o.italic });
   return outFont(doc, cache, 'std:' + k, async () => ({ font: await doc.embedFont(StandardFonts[k]), kind: 'std' })).then((x) => x.font);
 }
+// The rows of a text box as the screen shows them: its own line breaks, plus word wrap when it has a width.
+function textRows(o) {
+  const rows = [];
+  measureCanvas.font = `${o.italic ? 'italic ' : ''}${o.bold ? 'bold ' : ''}${o.size}px ${textCss(o)}`;
+  for (const para of o.text.split('\n')) {
+    if (!o.w) { rows.push({ text: para, last: true }); continue; }
+    const parts = [];
+    let cur = '';
+    for (const w of para.split(' ')) {
+      const t = cur ? cur + ' ' + w : w;
+      if (cur && measureCanvas.measureText(t).width > o.w + 0.01) { parts.push(cur); cur = w; } else cur = t;
+    }
+    parts.push(cur);
+    parts.forEach((t, i) => rows.push({ text: t, last: i === parts.length - 1 }));
+  }
+  return rows;
+}
 // one line of a text box as [font, text] runs: a document font supplies what it embeds, its fallback the rest
 async function textRuns(doc, cache, o, line, stats) {
   const info = docFont(o);
@@ -3286,25 +3310,46 @@ async function drawObj(doc, page, pg, o, cache, stats) {
   const rot = degrees(R(pg));
   const op = o.opacity ?? 1;
   if (o.type === 'text') {
+    const rows = textRows(o);
+    const runsW = (rs) => rs.reduce((a, r) => a + r.font.widthOfTextAtSize(r.text, o.size), 0);
     const lines = [];
-    for (const l of o.text.split('\n')) lines.push(await textRuns(doc, cache, o, l, stats));
-    const widths = lines.map((rs) => rs.reduce((a, r) => a + r.font.widthOfTextAtSize(r.text, o.size), 0));
-    const boxW = Math.max(0, ...widths);
+    for (const r of rows) lines.push(await textRuns(doc, cache, o, r.text, stats));
+    const widths = lines.map(runsW);
+    const boxW = o.w || Math.max(0, ...widths);
     const fam = textCss(o);
-    const bl = baselineRatio(fam, RT.customFonts.has(o.font) || docFont(o)?.css ? null : { bold: o.bold, italic: o.italic });
-    lines.forEach((rs, i) => {
-      const dx = o.align === 'center' ? (boxW - widths[i]) / 2 : o.align === 'right' ? boxW - widths[i] : 0;
-      const by = o.y + bl * o.size + i * LINE_H * o.size;
-      let x = o.x + dx;
+    const single = RT.customFonts.has(o.font) || !!docFont(o); // one face only: bold/italic are synthesized
+    const bl = baselineRatio(fam, single && (RT.customFonts.has(o.font) || docFont(o)?.css) ? null : { bold: o.bold, italic: o.italic });
+    const [cr, cg, cb] = hex2rgb(o.color);
+    const drawRuns = (rs, x, by) => {
       for (const r of rs) {
-        if (r.text) { const p = map(x, by); page.drawText(r.text, { x: p.x, y: p.y, size: o.size, font: r.font, color: pdfColor(o.color), opacity: op, rotate: rot }); }
+        if (r.text.trim()) {
+          const p = map(x, by);
+          if (single && o.bold) page.pushOperators(pushGraphicsState(), setTextRenderingMode(2), setLineWidth(o.size * 0.035), setStrokingRgbColor(cr / 255, cg / 255, cb / 255));
+          page.drawText(r.text, { x: p.x, y: p.y, size: o.size, font: r.font, color: pdfColor(o.color), opacity: op, rotate: rot, ...(single && o.italic ? { ySkew: degrees(12) } : {}) });
+          if (single && o.bold) page.pushOperators(popGraphicsState());
+        }
         x += r.font.widthOfTextAtSize(r.text, o.size);
       }
-      if (o.underline && widths[i]) {
-        const a = map(o.x + dx, by + o.size * 0.12), b = map(o.x + dx + widths[i], by + o.size * 0.12);
+      return x;
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const by = o.y + bl * o.size + i * LINE_H * o.size;
+      const words = rows[i].text.split(' ');
+      let dx = o.align === 'center' ? (boxW - widths[i]) / 2 : o.align === 'right' ? boxW - widths[i] : 0, lineW = widths[i];
+      if (o.align === 'justify' && !rows[i].last && words.length > 1) {
+        // spread the words to both edges of the box
+        const wr = [];
+        for (const w of words) wr.push(await textRuns(doc, cache, o, w, stats));
+        const gap = (boxW - wr.reduce((a, rs) => a + runsW(rs), 0)) / (words.length - 1);
+        let x = o.x;
+        for (const rs of wr) x = drawRuns(rs, x, by) + gap;
+        dx = 0; lineW = boxW;
+      } else drawRuns(lines[i], o.x + dx, by);
+      if (o.underline && lineW) {
+        const a = map(o.x + dx, by + o.size * 0.12), b = map(o.x + dx + lineW, by + o.size * 0.12);
         page.drawLine({ start: a, end: b, thickness: Math.max(0.5, o.size * 0.06), color: pdfColor(o.color), opacity: op });
       }
-    });
+    }
   } else if (o.type === 'box' || o.type === 'ellipse') {
     const common = { opacity: op, borderOpacity: op, rotate: rot };
     if (o.fill) common.color = pdfColor(o.fill);

@@ -197,7 +197,7 @@ svg.vec .hitpath { pointer-events: stroke; stroke: transparent; cursor: move; }
 .handle[data-h="nw"], .handle[data-h="se"] { cursor: nwse-resize; }
 .handle[data-h="ne"], .handle[data-h="sw"] { cursor: nesw-resize; }
 .handle[data-h="n"], .handle[data-h="s"] { cursor: ns-resize; }
-.handle[data-h="e"], .handle[data-h="w"] { cursor: ew-resize; }
+.handle[data-h="e"], .handle[data-h="w"], .handle[data-h="tw"] { cursor: ew-resize; }
 .handle[data-h="p1"], .handle[data-h="p2"] { cursor: move; border-radius: 50%; }
 .handle[data-h="fs"] { cursor: nwse-resize; border-radius: 50%; background: var(--accent); }
 .drag-rect { position: absolute; border: 1px dashed var(--accent); background: var(--accent-soft); pointer-events: none; }
